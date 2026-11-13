@@ -1254,6 +1254,170 @@ func TestH265Packetizer_Fragmented(t *testing.T) {
 	assert.True(t, H265FragmentationUnitHeader(packets[1][2]).E(), "Second FU header should be E")
 }
 
+// TestH265Payloader_Payload_ParameterSetUpdatesStayLinear ensures that a long
+// stream of parameter-set updates never grows the cache beyond the number of
+// valid parameter-set IDs: replacing an ID must not accumulate history or copy
+// every previously seen NAL on each send.
+func TestH265Payloader_Payload_ParameterSetUpdatesStayLinear(t *testing.T) {
+	const updateCount = 6000
+
+	packetizer := H265Payloader{}
+	vcl := createTestH265NALU(19, []byte{0x06})
+	var latestVps []byte
+
+	for i := range updateCount {
+		id := byte(i % h265MaxVpsCount)
+		// High nibble carries vps_video_parameter_set_id; low byte varies the
+		// payload so each update really replaces the cached entry.
+		latestVps = createTestH265NALU(h265NaluVpsType, []byte{id << 4, byte(i)}) //nolint:gosec // G115 test data
+		assert.Empty(t, packetizer.Payload(1500, latestVps))
+		if packetizer.cache != nil {
+			assert.LessOrEqual(t, len(packetizer.cache.entries), h265MaxVpsCount)
+		}
+	}
+
+	payloads := packetizer.Payload(1500, vcl)
+	assert.Nil(t, packetizer.cache, "cache must be consumed once a VCL NAL is emitted")
+	if !assert.Len(t, payloads, 1) {
+		return
+	}
+
+	aggregation, err := parseH265AggregationPacket(payloads[0], false)
+	assert.NoError(t, err)
+	packets, err := splitH265AggregationPacket(*aggregation)
+	assert.NoError(t, err)
+
+	// Every valid VPS ID appears exactly once, followed by the VCL NAL.
+	assert.Len(t, packets, h265MaxVpsCount+1)
+	seen := make(map[uint8]bool, h265MaxVpsCount)
+	for _, packet := range packets[:h265MaxVpsCount] {
+		assert.Equal(t, uint8(h265NaluVpsType), packet.payloadHeader.Type())
+		id := packet.payload[0] >> 4
+		assert.False(t, seen[id], "vps id %d emitted more than once", id)
+		seen[id] = true
+	}
+	assert.Len(t, seen, h265MaxVpsCount)
+	assert.Equal(t, uint8(19), packets[len(packets)-1].payloadHeader.Type())
+}
+
+// TestH265Payloader_Payload_AggregationRespectsMTUBoundary forces the payloader
+// to split a frame with several parameter sets into multiple aggregation/single
+// packets and asserts that no emitted packet ever exceeds the MTU.
+func TestH265Payloader_Payload_AggregationRespectsMTUBoundary(t *testing.T) {
+	const mtu = 24
+
+	packetizer := H265Payloader{}
+	nalus := [][]byte{
+		createTestH265NALU(h265NaluVpsType, []byte{0x00}),
+		createTestH265NALU(h265NaluSpsType, createTestH265SpsPayload()),
+		createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 0)),
+		createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 1)),
+	}
+	for _, nalu := range nalus {
+		assert.Empty(t, packetizer.Payload(mtu, nalu))
+	}
+
+	vcl := createTestH265NALU(19, []byte{0x06, 0x07})
+	payloads := packetizer.Payload(mtu, vcl)
+
+	// The frame cannot fit in a single aggregation packet at this MTU.
+	if !assert.Greater(t, len(payloads), 1) {
+		return
+	}
+	for i, payload := range payloads {
+		assert.LessOrEqual(t, len(payload), int(mtu), "packet %d exceeds the MTU", i)
+	}
+
+	// All four parameter sets plus the VCL NAL must still be represented.
+	depacketizer := H265Depacketizer{}
+	emitted := make([]h265SingleNALUnitPacket, 0)
+	for _, payload := range payloads {
+		out, err := depacketizer.Unmarshal(payload)
+		assert.NoError(t, err)
+		emitNalus(out, func(nalu []byte) {
+			parsed, err := parseH265SingleNalUnitPacket(nalu, false)
+			assert.NoError(t, err)
+			if err == nil {
+				emitted = append(emitted, *parsed)
+			}
+		})
+	}
+	assert.Len(t, emitted, len(nalus)+1)
+	assert.Equal(t, uint8(h265NaluVpsType), emitted[0].payloadHeader.Type())
+	assert.Equal(t, uint8(19), emitted[len(emitted)-1].payloadHeader.Type())
+}
+
+// TestH265Payloader_Payload_FragmentsLargeParameterSetWithMultipleIDs covers the
+// interaction of multi-ID caching and fragmentation: a parameter set larger than
+// the MTU is deferred until the VCL NAL and emitted as fragmentation units, while
+// the other cached parameter sets remain aggregated, all within the MTU.
+func TestH265Payloader_Payload_FragmentsLargeParameterSetWithMultipleIDs(t *testing.T) {
+	const mtu = 25
+
+	packetizer := H265Payloader{}
+
+	smallVps := createTestH265NALU(h265NaluVpsType, []byte{0x00})
+	assert.Empty(t, packetizer.Payload(mtu, smallVps))
+
+	// An over-MTU SPS whose prefix still parses to sps_seq_parameter_set_id = 0.
+	largeSpsPayload := make([]byte, 80)
+	copy(largeSpsPayload, createTestH265SpsPayload())
+	largeSps := createTestH265NALU(h265NaluSpsType, largeSpsPayload)
+	assert.Empty(t, packetizer.Payload(mtu, largeSps))
+
+	pps0 := createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 0))
+	pps1 := createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 1))
+	assert.Empty(t, packetizer.Payload(mtu, pps0))
+	assert.Empty(t, packetizer.Payload(mtu, pps1))
+
+	vcl := createTestH265NALU(19, make([]byte, 60))
+	payloads := packetizer.Payload(mtu, vcl)
+	assert.NotEmpty(t, payloads)
+	assert.Nil(t, packetizer.cache)
+
+	for i, payload := range payloads {
+		assert.LessOrEqual(t, len(payload), int(mtu), "packet %d exceeds the MTU", i)
+	}
+
+	// Reassemble every emitted packet and confirm all four parameter sets and the
+	// VCL NAL survive, with the over-MTU SPS reconstructed from its fragments.
+	depacketizer := H265Depacketizer{}
+	var reassembled []byte
+	for _, payload := range payloads {
+		out, err := depacketizer.Unmarshal(payload)
+		assert.NoError(t, err)
+		reassembled = append(reassembled, out...)
+	}
+	emitted := make([][]byte, 0)
+	emitNalus(reassembled, func(nalu []byte) {
+		emitted = append(emitted, append([]byte(nil), nalu...))
+	})
+	assert.Len(t, emitted, 5)
+	assert.Equal(t, smallVps, emitted[0])
+	assert.Equal(t, largeSps, emitted[1])
+	assert.Equal(t, pps0, emitted[2])
+	assert.Equal(t, pps1, emitted[3])
+	assert.Equal(t, vcl, emitted[4])
+}
+
+// TestH265Payloader_Payload_KeepsDistinctIDsPerParameterSetType verifies that
+// VPS, SPS and PPS are tracked in independent ID spaces: an ID reused across
+// different parameter-set types never replaces the other type's entry.
+func TestH265Payloader_Payload_KeepsDistinctIDsPerParameterSetType(t *testing.T) {
+	packetizer := H265Payloader{}
+
+	vps := createTestH265NALU(h265NaluVpsType, []byte{0x00})
+	sps := createTestH265NALU(h265NaluSpsType, createTestH265SpsPayload())
+	pps := createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 0))
+	vcl := createTestH265NALU(19, []byte{0x06})
+
+	payloads := packetizer.Payload(1500, createTestH265AnnexB(vps, sps, pps, vcl))
+	if !assert.Len(t, payloads, 1) {
+		return
+	}
+	assertH265AggregationPayload(t, payloads[0], vps, sps, pps, vcl)
+}
+
 func TestH265Depacketizer_Roundtrip(t *testing.T) {
 	testDepacketizer := func(packets [][]byte, expected []h265SingleNALUnitPacket, withDonl bool) {
 		depacketizer := H265Depacketizer{

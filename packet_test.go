@@ -4,10 +4,14 @@
 package rtp
 
 import (
+	"bytes"
 	"fmt"
+	"io"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestBasic(t *testing.T) { // nolint:maintidx,cyclop
@@ -1706,5 +1710,122 @@ func BenchmarkUnmarshalHeader(b *testing.B) {
 				b.Fatal(err)
 			}
 		}
+	})
+}
+
+func TestMarshalToInitializesPadding(t *testing.T) {
+	newPacket := func(paddingSize byte, useDeprecatedField bool) Packet {
+		packet := Packet{
+			Header: Header{
+				Version:     2,
+				Padding:     paddingSize > 0,
+				PaddingSize: paddingSize,
+			},
+			Payload: []byte{0x98, 0x36, 0xbe},
+		}
+		if useDeprecatedField {
+			packet.Header.PaddingSize = 0
+			packet.PaddingSize = paddingSize
+		}
+
+		return packet
+	}
+
+	for _, paddingSize := range []byte{1, 4, 255} {
+		for _, api := range []string{"Packet", "MarshalPacketTo", "DeprecatedPaddingSize"} {
+			t.Run(fmt.Sprintf("%s/padding=%d", api, paddingSize), func(t *testing.T) {
+				packet := newPacket(paddingSize, api == "DeprecatedPaddingSize")
+
+				// A fresh allocation is the reference encoding: padding is zeroed.
+				expected, err := packet.Marshal()
+				require.NoError(t, err)
+
+				buf := bytes.Repeat([]byte{0xa5}, len(expected)+16)
+				var n int
+				if api == "MarshalPacketTo" {
+					n, err = MarshalPacketTo(buf, &packet.Header, packet.Payload)
+				} else {
+					n, err = packet.MarshalTo(buf)
+				}
+				require.NoError(t, err)
+				require.Equal(t, len(expected), n)
+				assert.Equal(t, expected, buf[:n], "reused buffer differs from fresh allocation")
+				assert.Equal(t, bytes.Repeat([]byte{0xa5}, 16), buf[n:], "bytes after the packet must be untouched")
+
+				// The caller's payload must not be modified.
+				assert.Equal(t, []byte{0x98, 0x36, 0xbe}, packet.Payload)
+			})
+		}
+	}
+
+	// Regression cases that do not involve padding at all.
+	t.Run("NoPadding", func(t *testing.T) {
+		packet := newPacket(0, false)
+		expected, err := packet.Marshal()
+		require.NoError(t, err)
+
+		buf := bytes.Repeat([]byte{0xa5}, len(expected)+16)
+		n, err := packet.MarshalTo(buf)
+		require.NoError(t, err)
+		assert.Equal(t, expected, buf[:n])
+		assert.Equal(t, bytes.Repeat([]byte{0xa5}, 16), buf[n:])
+	})
+
+	t.Run("EmptyPayload", func(t *testing.T) {
+		packet := newPacket(5, false)
+		packet.Payload = nil
+		expected, err := packet.Marshal()
+		require.NoError(t, err)
+
+		buf := bytes.Repeat([]byte{0xa5}, len(expected)+16)
+		n, err := packet.MarshalTo(buf)
+		require.NoError(t, err)
+		assert.Equal(t, expected, buf[:n])
+		assert.Equal(t, bytes.Repeat([]byte{0xa5}, 16), buf[n:])
+	})
+
+	t.Run("ZeroPaddingSizeRejected", func(t *testing.T) {
+		packet := newPacket(0, false)
+		packet.Header.Padding = true
+
+		_, err := packet.MarshalTo(make([]byte, packet.MarshalSize()))
+		assert.ErrorIs(t, err, errInvalidRTPPadding)
+	})
+
+	// The buffer must be exactly large enough; a short one must not be written.
+	t.Run("BufferExactlyFits", func(t *testing.T) {
+		packet := newPacket(4, false)
+		expected, err := packet.Marshal()
+		require.NoError(t, err)
+
+		buf := bytes.Repeat([]byte{0xa5}, len(expected))
+		n, err := packet.MarshalTo(buf)
+		require.NoError(t, err)
+		assert.Equal(t, expected, buf[:n])
+
+		short := bytes.Repeat([]byte{0xa5}, len(expected)-1)
+		n, err = packet.MarshalTo(short)
+		assert.ErrorIs(t, err, io.ErrShortBuffer)
+		assert.Equal(t, 0, n)
+	})
+
+	// Serializing 10000 fixed-size packets into a reused buffer must stay
+	// linear: constant per-packet cost and no per-packet allocations.
+	t.Run("LinearForFixedSize", func(t *testing.T) {
+		packet := newPacket(16, false)
+		buf := make([]byte, packet.MarshalSize())
+
+		const packetCount = 10000
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		for range packetCount {
+			n, err := packet.MarshalTo(buf)
+			require.NoError(t, err)
+			require.Equal(t, len(buf), n)
+		}
+		runtime.ReadMemStats(&after)
+
+		assert.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(packetCount),
+			"marshalling must stay linear: no per-packet allocation")
 	})
 }

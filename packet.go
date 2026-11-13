@@ -557,6 +557,10 @@ func marshalPayloadAndPaddingTo(buf []byte, offset int, header *Header, payload 
 
 	m := copy(buf[offset:], payload)
 
+	// Padding is part of the serialized packet and must not expose stale data
+	// when the caller reuses a buffer.
+	clear(buf[offset+m : offset+m+int(paddingSize)])
+
 	if header.Padding {
 		buf[offset+m+int(paddingSize-1)] = paddingSize
 	}

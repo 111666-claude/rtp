@@ -621,6 +621,12 @@ func (p *Packet) paddingSize() byte {
 //
 // Deprecated: this function is a temporary workaround and will be removed in pion/webrtc v5.
 func MarshalPacketTo(buf []byte, header *Header, payload []byte) (int, error) {
+	// Match Packet.MarshalTo: a set padding bit requires a length, and reject
+	// before writing so the caller's buffer stays untouched.
+	if header.Padding && header.PaddingSize == 0 {
+		return 0, errInvalidRTPPadding
+	}
+
 	n, err := header.MarshalTo(buf)
 	if err != nil {
 		return 0, err

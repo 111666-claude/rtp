@@ -6,6 +6,7 @@ package rtp
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -1711,35 +1712,159 @@ func BenchmarkUnmarshalHeader(b *testing.B) {
 	})
 }
 
-func TestMarshalToInitializesPadding(t *testing.T) {
-	for _, paddingSize := range []byte{0, 1, 4, 255} {
-		for _, api := range []string{"Packet", "MarshalPacketTo", "DeprecatedPaddingSize"} {
-			t.Run(fmt.Sprintf("%s/padding=%d", api, paddingSize), func(t *testing.T) {
-				packet := Packet{
-					Header:  Header{Version: 2, Padding: paddingSize > 0, PaddingSize: paddingSize},
-					Payload: []byte{1, 2, 3},
-				}
-				if api == "DeprecatedPaddingSize" {
-					packet.Header.PaddingSize = 0
-					packet.PaddingSize = paddingSize
-				}
+// newPaddingTestPacket builds a packet with a fixed header, the given payload,
+// and padding configured either through Header.PaddingSize or the deprecated
+// Packet.PaddingSize field.
+func newPaddingTestPacket(headerPaddingSize, deprecatedPaddingSize byte, payload []byte) *Packet {
+	return &Packet{
+		Header: Header{
+			Version:        2,
+			Padding:        headerPaddingSize > 0 || deprecatedPaddingSize > 0,
+			PaddingSize:    headerPaddingSize,
+			PayloadType:    111,
+			SequenceNumber: 1234,
+			Timestamp:      5678,
+			SSRC:           0xDEADBEEF,
+		},
+		Payload:     payload,
+		PaddingSize: deprecatedPaddingSize,
+	}
+}
 
-				// A fresh allocation provides the expected wire encoding.
-				// reusing buffer exposed media data for FlexFEC users.
-				expected, err := packet.Marshal()
-				require.NoError(t, err)
-				buf := bytes.Repeat([]byte{0xa5}, len(expected)+16)
-				var n int
-				if api == "MarshalPacketTo" {
-					n, err = MarshalPacketTo(buf, &packet.Header, packet.Payload)
-				} else {
-					n, err = packet.MarshalTo(buf)
+func TestMarshalToInitializesPadding(t *testing.T) {
+	const (
+		tailSize = 16
+		fill     = 0xA5
+	)
+
+	type apiCase struct {
+		name    string
+		build   func(byte, []byte) *Packet
+		marshal func(*Packet, []byte) (int, error)
+	}
+
+	cases := []apiCase{
+		{
+			name:    "Packet",
+			build:   func(pad byte, payload []byte) *Packet { return newPaddingTestPacket(pad, 0, payload) },
+			marshal: func(p *Packet, buf []byte) (int, error) { return p.MarshalTo(buf) },
+		},
+		{
+			name:    "MarshalPacketTo",
+			build:   func(pad byte, payload []byte) *Packet { return newPaddingTestPacket(pad, 0, payload) },
+			marshal: func(p *Packet, buf []byte) (int, error) { return MarshalPacketTo(buf, &p.Header, p.Payload) },
+		},
+		// The deprecated field must behave exactly like Header.PaddingSize.
+		{
+			name:    "DeprecatedPaddingSize",
+			build:   func(pad byte, payload []byte) *Packet { return newPaddingTestPacket(0, pad, payload) },
+			marshal: func(p *Packet, buf []byte) (int, error) { return p.MarshalTo(buf) },
+		},
+	}
+
+	for _, paddingSize := range []byte{0, 1, 2, 4, 255} {
+		for _, api := range cases {
+			if paddingSize == 0 && api.name == "DeprecatedPaddingSize" {
+				continue // no padding and no length: nothing to distinguish
+			}
+			t.Run(fmt.Sprintf("%s/padding=%d", api.name, paddingSize), func(t *testing.T) {
+				for _, payload := range [][]byte{nil, {}, {1, 2, 3}} {
+					packet := api.build(paddingSize, payload)
+
+					// A fresh allocation provides the expected wire encoding.
+					// Reusing a buffer used to expose stale media data in the
+					// padding region to encryption and FEC layers.
+					expected, err := packet.Marshal()
+					require.NoError(t, err)
+					require.Equal(t, len(expected), packet.MarshalSize())
+
+					// Locate the first padding byte so the test can assert it is
+					// zeroed rather than merely "equal to what a fresh buffer got".
+					paddingStart := len(expected) - int(packet.paddingSize())
+
+					buf := bytes.Repeat([]byte{fill}, len(expected)+tailSize)
+					n, err := api.marshal(packet, buf)
+					require.NoError(t, err)
+					require.Equal(t, len(expected), n)
+					assert.Equal(t, expected, buf[:n])
+
+					// RFC 3550 requires padding bytes to be zero except for the
+					// final byte, which carries the padding length.
+					if paddingSize > 0 {
+						assert.Equal(t, bytes.Repeat([]byte{0x00}, int(paddingSize)-1),
+							buf[paddingStart:n-1], "padding region must be zeroed")
+						assert.Equal(t, paddingSize, buf[n-1], "last padding byte is the length")
+					}
+
+					assert.Equal(t, bytes.Repeat([]byte{fill}, tailSize), buf[n:],
+						"bytes beyond the packet must be untouched")
+
+					// A buffer one byte too small must fail cleanly even when the
+					// payload is empty and only the header and padding remain.
+					short := bytes.Repeat([]byte{fill}, len(expected)-1)
+					shortN, shortErr := api.marshal(packet, short)
+					assert.ErrorIs(t, shortErr, io.ErrShortBuffer)
+					assert.Equal(t, 0, shortN)
+
+					// The caller's payload is never used as scratch space.
+					assert.Equal(t, payload, packet.Payload)
 				}
-				require.NoError(t, err)
-				require.Equal(t, len(expected), n)
-				assert.Equal(t, expected, buf[:n])
-				assert.Equal(t, bytes.Repeat([]byte{0xa5}, 16), buf[n:], "bytes beyond the packet must be untouched")
 			})
 		}
 	}
+
+	// A set padding bit without a length is invalid. Both entry points must
+	// agree, and neither may index out of bounds or write to the buffer.
+	t.Run("padding bit without length", func(t *testing.T) {
+		header := Header{Version: 2, Padding: true, PayloadType: 1}
+		payload := []byte{1, 2, 3}
+
+		untouched := bytes.Repeat([]byte{fill}, 64)
+
+		buf := bytes.Repeat([]byte{fill}, 64)
+		n, err := (&Packet{Header: header, Payload: payload}).MarshalTo(buf)
+		assert.ErrorIs(t, err, errInvalidRTPPadding)
+		assert.Equal(t, 0, n)
+		assert.Equal(t, untouched, buf, "header must not be written")
+
+		n, err = MarshalPacketTo(buf, &header, payload)
+		assert.ErrorIs(t, err, errInvalidRTPPadding)
+		assert.Equal(t, 0, n)
+		assert.Equal(t, untouched, buf, "header must not be written")
+	})
+}
+
+// TestMarshalToPaddingLinear guards against padding handling introducing work
+// proportional to the buffer rather than to the packet.
+func TestMarshalToPaddingLinear(t *testing.T) {
+	const packetSize = 1200
+
+	packet := Packet{
+		Header:  Header{Version: 2, Padding: true, PaddingSize: 4},
+		Payload: bytes.Repeat([]byte{0x42}, packetSize-4),
+	}
+	expected, err := packet.Marshal()
+	require.NoError(t, err)
+
+	// Reusing one buffer for many fixed-size packets must not allocate and must
+	// keep writing the same deterministic bytes, so any per-packet work that
+	// grew with the buffer (or with the packet count) would show up here.
+	buf := bytes.Repeat([]byte{0xA5}, len(expected)+16)
+	var ok bool
+	alloc := testing.AllocsPerRun(1, func() {
+		ok = true
+		for i := 0; i < 10000; i++ {
+			n, marshalErr := packet.MarshalTo(buf)
+			if marshalErr != nil || n != len(expected) {
+				ok = false
+
+				return
+			}
+		}
+	})
+	require.True(t, ok)
+	assert.Zero(t, alloc, "reusing a buffer must not allocate per packet")
+	assert.Equal(t, expected, buf[:len(expected)])
+	assert.Equal(t, bytes.Repeat([]byte{0xA5}, 16), buf[len(expected):],
+		"tail must stay untouched across 10000 packets")
 }

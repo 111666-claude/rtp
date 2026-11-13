@@ -548,6 +548,258 @@ func TestAV1Depacketizer_aggregationHeader(t *testing.T) {
 	}
 }
 
+// buildAV1FragmentedOBUSequence builds an OBU of obuType split into a first fragment of
+// firstLen bytes followed by contCount continuation fragments of contLen bytes each.
+// It returns the RTP payloads (aggregation header + length field + fragment) and the
+// expected depacketized output (OBU with a calculated obu_size_field).
+func buildAV1FragmentedOBUSequence(obuType obu.Type, firstLen, contCount, contLen int) ([][]byte, []byte) {
+	total := firstLen + contCount*contLen
+	obuData := make([]byte, total)
+	header := obu.Header{Type: obuType}
+	obuData[0] = header.Marshal()[0]
+	for i := 1; i < total; i++ {
+		obuData[i] = byte(i)
+	}
+
+	header.HasSizeField = true
+	expected := header.Marshal()
+	expected = append(expected, obu.WriteToLeb128(uint(total-1))...) //nolint:gosec // G115
+	expected = append(expected, obuData[1:]...)
+
+	fragment := func(data []byte, z, y bool) []byte {
+		var hdr byte
+		if z {
+			hdr |= av1ZMask
+		}
+		if y {
+			hdr |= av1YMask
+		}
+		pkt := []byte{hdr}
+		pkt = append(pkt, obu.WriteToLeb128(uint(len(data)))...) //nolint:gosec // G115
+
+		return append(pkt, data...)
+	}
+
+	packets := make([][]byte, 0, contCount+1)
+	packets = append(packets, fragment(obuData[:firstLen], false, true))
+	for i := 0; i < contCount; i++ {
+		frag := obuData[firstLen+i*contLen : firstLen+(i+1)*contLen]
+		packets = append(packets, fragment(frag, true, i != contCount-1))
+	}
+
+	return packets, expected
+}
+
+// Reassembling a long fragment sequence must not allocate per fragment:
+// the reassembly buffer is owned by the depacketizer and grows geometrically.
+func TestAV1Depacketizer_longFragmentSequenceAllocations(t *testing.T) {
+	packets, expected := buildAV1FragmentedOBUSequence(obu.OBUTileGroup, 1025, 512, 1024)
+
+	depacketizer := &AV1Depacketizer{}
+	var out []byte
+	for _, pkt := range packets {
+		var err error
+		out, err = depacketizer.Unmarshal(pkt)
+		assert.NoError(t, err)
+	}
+	assert.Equal(t, expected, out)
+
+	allocs := testing.AllocsPerRun(1, func() {
+		d := &AV1Depacketizer{}
+		for _, pkt := range packets {
+			if _, err := d.Unmarshal(pkt); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	assert.Less(t, allocs, float64(64),
+		"reassembly of %d fragments allocated %.0f times, want geometric growth", len(packets), allocs)
+}
+
+// The depacketizer must own its reassembly state: bytes kept across Unmarshal
+// calls are copied, so a caller reusing its packet buffer cannot corrupt them.
+func TestAV1Depacketizer_fragmentStateDoesNotAliasPayload(t *testing.T) {
+	fullOBU, expected := createAV1OBU(obu.OBUTileGroup, []byte{
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
+		0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14,
+	})
+	frag1 := fullOBU[:11]
+	frag2 := fullOBU[11:]
+
+	depacketizer := &AV1Depacketizer{}
+
+	// Reuse one backing array for both packets, as a caller reading from a socket would.
+	pkt := []byte{av1YMask}
+	pkt = append(pkt, obu.WriteToLeb128(uint(len(frag1)))...)
+	pkt = append(pkt, frag1...)
+
+	obus, err := depacketizer.Unmarshal(pkt)
+	assert.NoError(t, err)
+	assert.Len(t, obus, 0)
+
+	next := []byte{av1ZMask}
+	next = append(next, obu.WriteToLeb128(uint(len(frag2)))...)
+	next = append(next, frag2...)
+	copy(pkt, next) // the next packet arrives into the same buffer
+
+	obus, err = depacketizer.Unmarshal(pkt[:len(next)])
+	assert.NoError(t, err)
+	assert.Equal(t, expected, obus)
+}
+
+// Slices returned by Unmarshal are owned by the caller: later packets,
+// including fragmented ones that reuse the internal buffer, must not modify them.
+func TestAV1Depacketizer_returnedSlicesNotSharedAcrossCalls(t *testing.T) {
+	obuData1, expected1 := createAV1OBU(obu.OBUTileGroup, []byte{0x01, 0x02, 0x03})
+	obuData2, expected2 := createAV1OBU(obu.OBUFrameHeader, []byte{0x04, 0x05, 0x06})
+
+	depacketizer := &AV1Depacketizer{}
+
+	packet := append([]byte{0x00}, obu.WriteToLeb128(uint(len(obuData1)))...)
+	packet = append(packet, obuData1...)
+	first, err := depacketizer.Unmarshal(packet)
+	assert.NoError(t, err)
+	assert.Equal(t, expected1, first)
+	saved := append([]byte(nil), first...)
+
+	// Interleave a fragmented OBU so the internal reassembly buffer is exercised.
+	packets, expectedFrag := buildAV1FragmentedOBUSequence(obu.OBUTileGroup, 8, 3, 8)
+	var fragOut []byte
+	for _, pkt := range packets {
+		fragOut, err = depacketizer.Unmarshal(pkt)
+		assert.NoError(t, err)
+	}
+	assert.Equal(t, expectedFrag, fragOut)
+
+	packet = append([]byte{0x00}, obu.WriteToLeb128(uint(len(obuData2)))...)
+	packet = append(packet, obuData2...)
+	second, err := depacketizer.Unmarshal(packet)
+	assert.NoError(t, err)
+	assert.Equal(t, expected2, second)
+
+	assert.Equal(t, saved, first, "first returned slice was modified by later packets")
+}
+
+// Fragment state must not leak across resets, empty fragments, truncated
+// packets, or into frames that begin and end within a single packet.
+func TestAV1Depacketizer_fragmentStateIsolation(t *testing.T) {
+	newOBU, expectedNewOBU := createAV1OBU(obu.OBUTileGroup, []byte{0x04, 0x05, 0x06})
+	singlePacket := append([]byte{0x00}, obu.WriteToLeb128(uint(len(newOBU)))...)
+	singlePacket = append(singlePacket, newOBU...)
+
+	t.Run("firstAndLastFragmentInSamePacket", func(t *testing.T) {
+		depacketizer := &AV1Depacketizer{}
+
+		// A complete OBU in a single packet must not leave reassembly state behind.
+		obus, err := depacketizer.Unmarshal(singlePacket)
+		assert.NoError(t, err)
+		assert.Equal(t, expectedNewOBU, obus)
+		assert.Len(t, depacketizer.buffer, 0)
+
+		// A following continuation packet has nothing to continue and is dropped.
+		obus, err = depacketizer.Unmarshal(
+			append(append([]byte{av1ZMask}, obu.WriteToLeb128(3)...), 0x01, 0x02, 0x03),
+		)
+		assert.NoError(t, err)
+		assert.Len(t, obus, 0)
+	})
+
+	t.Run("emptyFragment", func(t *testing.T) {
+		depacketizer := &AV1Depacketizer{}
+
+		// An empty first fragment (Y=1, zero length) stores nothing.
+		obus, err := depacketizer.Unmarshal([]byte{av1YMask, 0x00})
+		assert.NoError(t, err)
+		assert.Len(t, obus, 0)
+		assert.Len(t, depacketizer.buffer, 0)
+
+		// The continuation is treated as a lost fragment and dropped.
+		obus, err = depacketizer.Unmarshal(
+			append(append([]byte{av1ZMask}, obu.WriteToLeb128(3)...), 0x01, 0x02, 0x03),
+		)
+		assert.NoError(t, err)
+		assert.Len(t, obus, 0)
+
+		// And a fresh frame decodes cleanly.
+		obus, err = depacketizer.Unmarshal(singlePacket)
+		assert.NoError(t, err)
+		assert.Equal(t, expectedNewOBU, obus)
+	})
+
+	t.Run("truncatedLengthDoesNotCorruptState", func(t *testing.T) {
+		depacketizer := &AV1Depacketizer{}
+
+		fullOBU, expected := createAV1OBU(obu.OBUTileGroup, []byte{0x01, 0x02, 0x03, 0x04})
+		frag1, frag2 := fullOBU[:3], fullOBU[3:]
+
+		pkt := append([]byte{av1YMask}, obu.WriteToLeb128(uint(len(frag1)))...)
+		pkt = append(pkt, frag1...)
+		_, err := depacketizer.Unmarshal(pkt)
+		assert.NoError(t, err)
+
+		// Truncated: the length field promises more than the payload holds.
+		_, err = depacketizer.Unmarshal(
+			append(append([]byte{av1ZMask}, obu.WriteToLeb128(0x99)...), 0x01),
+		)
+		assert.ErrorIs(t, err, errShortPacket)
+
+		// A new frame (Z=0) resets the fragment state and decodes cleanly.
+		obus, err := depacketizer.Unmarshal(singlePacket)
+		assert.NoError(t, err)
+		assert.Equal(t, expectedNewOBU, obus)
+
+		// A well-formed fragmented OBU still reassembles.
+		pkt = append([]byte{av1YMask}, obu.WriteToLeb128(uint(len(frag1)))...)
+		pkt = append(pkt, frag1...)
+		_, err = depacketizer.Unmarshal(pkt)
+		assert.NoError(t, err)
+		pkt = append([]byte{av1ZMask}, obu.WriteToLeb128(uint(len(frag2)))...)
+		pkt = append(pkt, frag2...)
+		obus, err = depacketizer.Unmarshal(pkt)
+		assert.NoError(t, err)
+		assert.Equal(t, expected, obus)
+	})
+
+	t.Run("newFrameAfterReset", func(t *testing.T) {
+		depacketizer := &AV1Depacketizer{}
+
+		fullOBU, expected := createAV1OBU(obu.OBUTileGroup, []byte{0x01, 0x02, 0x03, 0x04})
+		frag1, frag2 := fullOBU[:3], fullOBU[3:]
+
+		// Start a fragmented OBU.
+		pkt := append([]byte{av1YMask}, obu.WriteToLeb128(uint(len(frag1)))...)
+		pkt = append(pkt, frag1...)
+		_, err := depacketizer.Unmarshal(pkt)
+		assert.NoError(t, err)
+
+		// N=1 announces a new frame: the stored fragment is discarded.
+		resetPacket := append([]byte{av1NMask}, obu.WriteToLeb128(uint(len(newOBU)))...)
+		resetPacket = append(resetPacket, newOBU...)
+		obus, err := depacketizer.Unmarshal(resetPacket)
+		assert.NoError(t, err)
+		assert.Equal(t, expectedNewOBU, obus)
+
+		// The stale fragment must not leak into the next reassembly:
+		// a continuation now is a lost fragment and gets dropped.
+		obus, err = depacketizer.Unmarshal(
+			append(append([]byte{av1ZMask}, obu.WriteToLeb128(uint(len(frag2)))...), frag2...),
+		)
+		assert.NoError(t, err)
+		assert.Len(t, obus, 0)
+
+		// Reassemble the same OBU properly after the reset.
+		pkt = append([]byte{av1YMask}, obu.WriteToLeb128(uint(len(frag1)))...)
+		pkt = append(pkt, frag1...)
+		_, err = depacketizer.Unmarshal(pkt)
+		assert.NoError(t, err)
+		pkt = append([]byte{av1ZMask}, obu.WriteToLeb128(uint(len(frag2)))...)
+		pkt = append(pkt, frag2...)
+		obus, err = depacketizer.Unmarshal(pkt)
+		assert.NoError(t, err)
+		assert.Equal(t, expected, obus)
+	})
+}
+
 func FuzzAV1DepacketizerUnmarshal(f *testing.F) {
 	f.Add([]byte{0x10, 0x01, 0x00})
 	f.Add([]byte{0x20, 0x01, 0x00, 0x01, 0x00})

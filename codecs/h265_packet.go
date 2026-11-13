@@ -1726,15 +1726,140 @@ func (p *H265Packet) Packet() isH265Packet {
 	return p.packet
 }
 
+// ITU-T H.265 limits the parameter set IDs to 4 bits for VPS and ue(v) values
+// below 64 for SPS/PPS. See sections 7.3.2.1, 7.3.2.2.1 and 7.3.2.3.
+const (
+	h265MaxVPSID = 15
+	h265MaxSPSID = 63
+	h265MaxPPSID = 63
+)
+
+// h265ParameterSetCache keeps one NAL unit per parameter set ID.
+//
+// The map provides constant time replacement of a given ID while the ordered
+// slice keeps aggregation order stable (insertion order). Reusing a payloader
+// across thousands of parameter set updates therefore stays linear: each update
+// only touches its own entry, the stored payloads are never copied.
+type h265ParameterSetCache struct {
+	byID  map[uint32]h265SingleNALUnitPacket
+	order []uint32
+}
+
+func newH265ParameterSetCache() h265ParameterSetCache {
+	return h265ParameterSetCache{
+		byID: make(map[uint32]h265SingleNALUnitPacket),
+	}
+}
+
+// store inserts the NAL unit for id, replacing only that entry when the ID is
+// already known.
+func (c *h265ParameterSetCache) store(id uint32, packet h265SingleNALUnitPacket) {
+	if _, exists := c.byID[id]; !exists {
+		c.order = append(c.order, id)
+	}
+
+	c.byID[id] = packet
+}
+
+// appendTo appends every cached NAL unit, in insertion order, to packets.
+func (c *h265ParameterSetCache) appendTo(packets []h265SingleNALUnitPacket) []h265SingleNALUnitPacket {
+	for _, id := range c.order {
+		packets = append(packets, c.byID[id])
+	}
+
+	return packets
+}
+
+// len returns the number of cached parameter sets.
+func (c *h265ParameterSetCache) len() int {
+	return len(c.byID)
+}
+
+// clear drops every cached parameter set.
+func (c *h265ParameterSetCache) clear() {
+	clear(c.byID)
+	c.order = c.order[:0]
+}
+
 // H265Payloader payloads H265 packets.
 type H265Payloader struct {
 	// Deprecated: Has no effect.
 	AddDONL bool
 	// SkipAggregation disables H265 aggregation packets.
-	SkipAggregation bool
-	vpsNalu         *h265SingleNALUnitPacket
-	spsNalu         *h265SingleNALUnitPacket
-	ppsNalu         *h265SingleNALUnitPacket
+	SkipAggregation    bool
+	vpsNalus           h265ParameterSetCache
+	spsNalus           h265ParameterSetCache
+	ppsNalus           h265ParameterSetCache
+	parameterSetsReady bool
+}
+
+// parameterSetCache returns the cache matching the NAL unit type together with
+// the maximum ID allowed for that kind of parameter set.
+func (p *H265Payloader) parameterSetCache(naluType uint8) (*h265ParameterSetCache, uint32, bool) {
+	switch naluType {
+	case h265NaluVpsType:
+		return &p.vpsNalus, h265MaxVPSID, true
+	case h265NaluSpsType:
+		return &p.spsNalus, h265MaxSPSID, true
+	case h265NaluPpsType:
+		return &p.ppsNalus, h265MaxPPSID, true
+	default:
+		return nil, 0, false
+	}
+}
+
+// cacheParameterSet stores the NAL unit under its parameter set ID. It returns
+// false when the NAL unit is corrupted or its ID cannot be parsed; such NAL
+// units must be forwarded inline rather than poisoning the cache.
+func (p *H265Payloader) cacheParameterSet(header H265NALUHeader, nalu []byte) bool {
+	// A set forbidden bit means the NAL unit violates the bitstream syntax.
+	if header.F() {
+		return false
+	}
+
+	cache, maxID, ok := p.parameterSetCache(header.Type())
+	if !ok {
+		return false
+	}
+
+	id, err := h265ParameterSetID(header.Type(), nalu[h265NaluHeaderSize:])
+	if err != nil || id > maxID {
+		return false
+	}
+
+	if !p.parameterSetsReady {
+		p.vpsNalus = newH265ParameterSetCache()
+		p.spsNalus = newH265ParameterSetCache()
+		p.ppsNalus = newH265ParameterSetCache()
+		p.parameterSetsReady = true
+	}
+
+	packet := h265SingleNALUnitPacket{
+		payloadHeader: header,
+		payload:       nalu[h265NaluHeaderSize:],
+	}
+	cache.store(id, packet)
+
+	return true
+}
+
+// drainParameterSets moves every cached parameter set into packets, VPS first
+// then SPS and PPS, each group in insertion order. The cache is emptied so the
+// configuration of one frame is never carried into an unrelated frame.
+func (p *H265Payloader) drainParameterSets(packets []h265SingleNALUnitPacket) []h265SingleNALUnitPacket {
+	if !p.parameterSetsReady {
+		return packets
+	}
+
+	packets = p.vpsNalus.appendTo(packets)
+	packets = p.spsNalus.appendTo(packets)
+	packets = p.ppsNalus.appendTo(packets)
+
+	p.vpsNalus.clear()
+	p.spsNalus.clear()
+	p.ppsNalus.clear()
+
+	return packets
 }
 
 // Payload fragments a H265 packet across one or more byte arrays.
@@ -1786,9 +1911,11 @@ func (p *H265Payloader) Payload(mtu uint16, payload []byte) [][]byte { // nolint
 		}
 
 		if p.SkipAggregation {
-			p.vpsNalu = nil
-			p.spsNalu = nil
-			p.ppsNalu = nil
+			p.vpsNalus.clear()
+			p.spsNalus.clear()
+			p.ppsNalus.clear()
+			p.parameterSetsReady = false
+
 			if len(nalu) > int(mtu) {
 				flushBuffer()
 				fragments, err := newH265FragmentationPackets(mtu, &packet)
@@ -1806,35 +1933,19 @@ func (p *H265Payloader) Payload(mtu uint16, payload []byte) [][]byte { // nolint
 		}
 
 		switch header.Type() {
-		case h265NaluVpsType:
-			p.vpsNalu = &packet
-
-			return
-		case h265NaluSpsType:
-			p.spsNalu = &packet
-
-			return
-		case h265NaluPpsType:
-			p.ppsNalu = &packet
-
-			return
+		case h265NaluVpsType, h265NaluSpsType, h265NaluPpsType:
+			// Valid parameter sets are cached per ID and emitted with the next
+			// VCL NAL unit. Unparseable ones fall through the regular path so
+			// they are still forwarded without corrupting the cache.
+			if p.cacheParameterSet(header, nalu) {
+				return
+			}
 		case h265NaluAudType, h265NaluFillerType:
 			return
 		}
 
-		pendingNalus := make([]h265SingleNALUnitPacket, 0, 4)
-		if p.vpsNalu != nil {
-			pendingNalus = append(pendingNalus, *p.vpsNalu)
-			p.vpsNalu = nil
-		}
-		if p.spsNalu != nil {
-			pendingNalus = append(pendingNalus, *p.spsNalu)
-			p.spsNalu = nil
-		}
-		if p.ppsNalu != nil {
-			pendingNalus = append(pendingNalus, *p.ppsNalu)
-			p.ppsNalu = nil
-		}
+		pendingCapacity := p.vpsNalus.len() + p.spsNalus.len() + p.ppsNalus.len() + 1
+		pendingNalus := p.drainParameterSets(make([]h265SingleNALUnitPacket, 0, pendingCapacity))
 
 		if len(nalu) <= int(mtu) {
 			pendingNalus = append(pendingNalus, packet)

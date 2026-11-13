@@ -334,6 +334,151 @@ func TestRTPHeaderLargerThanMtu(t *testing.T) {
 	assert.Nil(out, "should not output pkts")
 }
 
+func TestProcessEmptyInput(t *testing.T) {
+	assert := assert.New(t)
+
+	// arrange
+	spreader := NewSpreader(1200)
+
+	// act
+	out, err := spreader.Process(nil)
+
+	// assert
+	assert.NoError(err, "empty input should not fail")
+	assert.Empty(out, "empty input should not output pkts")
+
+	// act
+	out, err = spreader.Process([]byte{})
+
+	// assert
+	assert.NoError(err, "empty input should not fail")
+	assert.Empty(out, "empty input should not output pkts")
+	assert.Equal(false, spreader.Spreading, "empty input should not start spreading")
+	assert.Equal(uint16(0), spreader.RTPOffset, "Bad offset")
+}
+
+func TestFuaSequenceGapFlushesPending(t *testing.T) {
+	assert := assert.New(t)
+
+	// arrange
+	spreader := NewSpreader(100)
+	fuaStart := append(getRTPHeaderOffSet(0, false), 0x7C, 0x85)
+	fuaStart = append(fuaStart, make([]byte, 136)...)
+	// sequence gap: the next FU arrives with seq 5 instead of 1
+	fuaEnd := append(getRTPHeaderOffSet(5, true), 0x7C, 0x45, 0xAA)
+
+	// act
+	out1, err1 := spreader.Process(fuaStart)
+	out2, err2 := spreader.Process(fuaEnd)
+
+	// assert
+	assert.NoError(err1, "failed to process pkt")
+	assert.NoError(err2, "failed to process pkt")
+	if assert.Equal(1, len(out1), "bad pkt out count") {
+		expectedStart := append([]byte{0x7C, 0x85}, make([]byte, 86)...)
+		assert.Equal(append(getRTPHeaderOffSet(0, false), expectedStart...), out1[0], "bad payload start FUA")
+	}
+	if assert.Equal(2, len(out2), "pending fragment should be flushed before the new one") {
+		// the flushed pending fragment is emitted as a middle FU: neither start nor end bit
+		expectedFlushed := append([]byte{0x7C, 0x05}, make([]byte, 50)...)
+		assert.Equal(append(getRTPHeaderOffSet(1, false), expectedFlushed...), out2[0], "bad flushed FUA")
+		// the new fragment keeps its end bit and its marker, its seq is bumped
+		// by one to make room for the flushed packet
+		assert.Equal(append(getRTPHeaderOffSet(6, true), 0x7C, 0x45, 0xAA), out2[1], "bad payload end FUA")
+	}
+	assert.Equal(uint16(1), spreader.RTPOffset, "Bad offset")
+}
+
+// Processes 10000 fragments through the buffer-then-merge path: the work must
+// stay linear in the number of fragments, every output must fit the mtu, seq
+// nums must stay continuous and the start/end/marker bits must land exactly on
+// the first/last output packets.
+func TestManyFuaFragmentsAreMerged(t *testing.T) {
+	assert := assert.New(t)
+
+	// arrange
+	const nbFragments = 10000
+	spreader := NewSpreader(200)
+
+	var refPayload, reassembled, lastOut []byte
+	nbOut := 0
+	prevSeq := uint16(0)
+
+	// act
+	for i := 0; i < nbFragments; i++ {
+		fuHeader := byte(0x05)
+		fragSize := 10
+		switch i {
+		case 0:
+			fuHeader = 0x85
+			// force the first pkt above the mtu so re-fragmentation starts
+			fragSize = 250
+		case nbFragments - 1:
+			fuHeader = 0x45
+		}
+
+		data := make([]byte, fragSize)
+		for j := range data {
+			data[j] = byte(i + j)
+		}
+		refPayload = append(refPayload, data...)
+
+		rtpPkt := append(getRTPHeaderOffSet(uint16(i), i == nbFragments-1), 0x7C, fuHeader) //nolint:gosec // G115
+		rtpPkt = append(rtpPkt, data...)
+
+		out, err := spreader.Process(rtpPkt)
+		if !assert.NoError(err, "failed to process pkt") {
+			return
+		}
+
+		// assert per output pkt
+		for _, rtpOut := range out {
+			nbOut++
+			assert.LessOrEqual(len(rtpOut), 200, "pkt out is larger than mtu")
+
+			seqNum := binary.BigEndian.Uint16(rtpOut[rtpSeqNumOffset : rtpSeqNumOffset+rtpSeqNumLength])
+			if nbOut == 1 {
+				prevSeq = seqNum
+			} else {
+				prevSeq++
+				assert.Equal(prevSeq, seqNum, "seq num is not continuous")
+			}
+
+			isFirst := nbOut == 1
+			assert.Equal(isFirst, rtpOut[12+1]&fuStartBitmask != 0, "start bit on wrong pkt")
+
+			if i != nbFragments-1 {
+				assert.Equal(false, rtpOut[12+1]&fuEndBitmask != 0, "end bit before the last pkt")
+				assert.Equal(false, rtpOut[rtpMPtOffset]&rtpMarkerBitMask != 0, "marker before the last pkt")
+			}
+			lastOut = rtpOut
+
+			reassembled = append(reassembled, rtpOut[14:]...)
+		}
+	}
+
+	// assert final pkt
+	if assert.Greater(nbOut, 0, "should have output pkts") {
+		assert.Equal(true, lastOut[12+1]&fuEndBitmask != 0, "missing end bit on last pkt")
+		assert.Equal(true, lastOut[rtpMPtOffset]&rtpMarkerBitMask != 0, "missing marker on last pkt")
+	}
+	assert.Equal(refPayload, reassembled, "bad reassembly")
+}
+
+func BenchmarkSpreaderProcessFua(b *testing.B) {
+	spreader := NewSpreader(200)
+	rtpPkt := append(getRTPHeader(false), 0x7C, 0x05)
+	rtpPkt = append(rtpPkt, make([]byte, 250)...)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		binary.BigEndian.PutUint16(rtpPkt[rtpSeqNumOffset:rtpSeqNumOffset+rtpSeqNumLength], uint16(i)) //nolint:gosec // G115
+		if _, err := spreader.Process(rtpPkt); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func FuzzSpreaderProcess(f *testing.F) {
 	stapa := append(getRTPHeader(false), getH264StapADelimiterAndSpsAndPps()...)
 	sps := append(getRTPHeader(true), getH264SpsNal()...)

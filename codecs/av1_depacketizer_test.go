@@ -576,19 +576,279 @@ func FuzzAV1DepacketizerUnmarshal(f *testing.F) {
 	})
 }
 
+// buildLongFragmentStream builds an OBU split into a 1025-byte first packet
+// (aggregation header + 1024 OBU bytes) followed by 512 continuation packets
+// carrying 1024 OBU bytes each. The last continuation terminates the OBU
+// (Y=0); every intermediate packet keeps it fragmented (Y=1).
+func buildLongFragmentStream(t *testing.T) (packets [][]byte, expectedOBU []byte) {
+	t.Helper()
+
+	// One OBU without obu_size_field: 1-byte header (tile group) + payload.
+	// The first packet holds the header plus 1023 payload bytes; the 512
+	// continuations carry the remaining 1024 each.
+	payloadSize := 1023 + 512*1024
+	payload := make([]byte, payloadSize)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	rawOBU := append([]byte{0x20}, payload...)
+
+	// Expected low-overhead bitstream output: header with obu_has_size_field,
+	// LEB128 payload size, then the payload.
+	expectedOBU = append([]byte{0x22}, obu.WriteToLeb128(uint(payloadSize))...)
+	expectedOBU = append(expectedOBU, payload...)
+
+	// First packet: Z=0, Y=1, W=1. A single OBU element without a length field,
+	// 1024 OBU bytes (1025 bytes including the aggregation header).
+	first := make([]byte, 0, 1025)
+	first = append(first, 0x50)
+	first = append(first, rawOBU[:1024]...)
+	packets = append(packets, first)
+
+	off := 1024
+	for i := 0; i < 512; i++ {
+		agg := byte(0xd0) // Z=1, Y=1, W=1
+		if i == 511 {
+			agg = 0x90 // Z=1, Y=0, W=1: final fragment
+		}
+		pkt := make([]byte, 0, 1025)
+		pkt = append(pkt, agg)
+		pkt = append(pkt, rawOBU[off:off+1024]...)
+		packets = append(packets, pkt)
+		off += 1024
+	}
+
+	require.Equal(t, len(rawOBU), off)
+
+	return packets, expectedOBU
+}
+
 func TestAV1Depacketizer_fragmentAllocationGrowth(t *testing.T) {
-	first := make([]byte, 1025)
-	first[0], first[1] = 0x50, 0x20
-	continuation := make([]byte, 1025)
-	continuation[0] = 0xd0
+	packets, expectedOBU := buildLongFragmentStream(t)
+
 	allocations := testing.AllocsPerRun(1, func() {
 		depacketizer := AV1Depacketizer{}
-		_, err := depacketizer.Unmarshal(first)
+		_, err := depacketizer.Unmarshal(packets[0])
 		require.NoError(t, err)
-		for range 512 {
-			_, err = depacketizer.Unmarshal(continuation)
+		for _, pkt := range packets[1:] {
+			_, err = depacketizer.Unmarshal(pkt)
 			require.NoError(t, err)
 		}
 	})
 	assert.Less(t, allocations, float64(64))
+
+	// The reassembled OBU must be the exact byte-wise concatenation of every
+	// fragment, framed as a low-overhead bitstream OBU.
+	depacketizer := AV1Depacketizer{}
+	var output []byte
+	for i, pkt := range packets {
+		out, err := depacketizer.Unmarshal(pkt)
+		require.NoError(t, err)
+		if i < len(packets)-1 {
+			assert.Empty(t, out, "no OBU should be emitted before the final fragment")
+			continue
+		}
+		output = out
+	}
+	assert.Equal(t, expectedOBU, output)
+}
+
+// TestAV1Depacketizer_fragmentReassembly verifies that a fragment sequence is
+// reassembled in order, one segment at a time, even when the caller mutates or
+// reuses every input packet after Unmarshal returns.
+func TestAV1Depacketizer_fragmentReassembly(t *testing.T) {
+	packets, expectedOBU := buildLongFragmentStream(t)
+
+	depacketizer := AV1Depacketizer{}
+	var output []byte
+	for i, pkt := range packets {
+		out, err := depacketizer.Unmarshal(pkt)
+		require.NoError(t, err)
+
+		// The depacketizer must own its reassembly state: scribbling over the
+		// packet it was just handed must not affect any retained fragment.
+		for j := range pkt {
+			pkt[j] = 0xFF
+		}
+
+		if i < len(packets)-1 {
+			assert.Empty(t, out)
+			continue
+		}
+		output = out
+	}
+	require.NotNil(t, output)
+	assert.Equal(t, expectedOBU, output)
+}
+
+// TestAV1Depacketizer_fragmentBufferNoAlias ensures the retained fragment
+// never aliases the caller's packet while the OBU is in progress.
+func TestAV1Depacketizer_fragmentBufferNoAlias(t *testing.T) {
+	depacketizer := AV1Depacketizer{}
+
+	first := []byte{0x50, 0x20, 0x01, 0x02, 0x03}
+	out, err := depacketizer.Unmarshal(first)
+	require.NoError(t, err)
+	require.Empty(t, out)
+	require.NotEmpty(t, depacketizer.buffer)
+
+	first[1] = 0xEE
+	first[2] = 0xFF
+	assert.Equal(t, []byte{0x20, 0x01, 0x02, 0x03}, depacketizer.buffer,
+		"retained fragment must not alias the input packet")
+
+	// A continuation that extends the fragment keeps the same ownership rule.
+	continuation := []byte{0xd0, 0x04, 0x05}
+	_, err = depacketizer.Unmarshal(continuation)
+	require.NoError(t, err)
+	continuation[1] = 0xEE
+	assert.Equal(t, []byte{0x20, 0x01, 0x02, 0x03, 0x04, 0x05}, depacketizer.buffer)
+}
+
+// TestAV1Depacketizer_completedOutputNoAlias verifies that a slice returned
+// for a completed OBU is not polluted by packets processed afterwards. This
+// covers a packet that completes one OBU and starts the next fragment.
+func TestAV1Depacketizer_completedOutputNoAlias(t *testing.T) {
+	depacketizer := AV1Depacketizer{}
+
+	// First packet: start a fragmented OBU (Z=0, Y=1, W=1, no length field).
+	_, err := depacketizer.Unmarshal([]byte{0x50, 0x20, 0x01, 0x02, 0x03})
+	require.NoError(t, err)
+
+	// Second packet (Z=1, Y=1, W=0): completes OBU #1 and starts OBU #2.
+	compound := []byte{
+		0xc0,                   // Z=1, Y=1, W=0
+		0x03, 0x04, 0x05, 0x06, // length 3: tail of OBU #1
+		0x04, 0x20, 0x0a, 0x0b, 0x0c, // length 4: head of OBU #2
+	}
+	firstOutput, err := depacketizer.Unmarshal(compound)
+	require.NoError(t, err)
+	expectedFirst := []byte{0x22, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06}
+	require.Equal(t, expectedFirst, firstOutput)
+	snapshot := append([]byte(nil), firstOutput...)
+
+	// Final packet (Z=1, Y=0, W=1): tail of OBU #2.
+	secondOutput, err := depacketizer.Unmarshal([]byte{0x90, 0x0d})
+	require.NoError(t, err)
+	expectedSecond := []byte{0x22, 0x04, 0x0a, 0x0b, 0x0c, 0x0d}
+	assert.Equal(t, expectedSecond, secondOutput)
+
+	// The earlier result must survive the later packet untouched.
+	assert.Equal(t, snapshot, firstOutput,
+		"returned OBU must not be mutated by subsequent packets")
+	assert.Nil(t, depacketizer.buffer, "buffer is released once the fragment completes")
+}
+
+// TestAV1Depacketizer_fragmentedFirstAndLastSamePacket covers an OBU whose
+// first and last (only) element in a packet is itself fragmented: the retained
+// buffer and the emitted output must both be independent of the input packet.
+func TestAV1Depacketizer_fragmentedFirstAndLastSamePacket(t *testing.T) {
+	depacketizer := AV1Depacketizer{}
+
+	pkt := []byte{0x50, 0x20, 0x07, 0x08}
+	out, err := depacketizer.Unmarshal(pkt)
+	require.NoError(t, err)
+	require.Empty(t, out)
+	require.Equal(t, []byte{0x20, 0x07, 0x08}, depacketizer.buffer)
+
+	pkt[1] = 0x11
+	require.Equal(t, []byte{0x20, 0x07, 0x08}, depacketizer.buffer)
+
+	out, err = depacketizer.Unmarshal([]byte{0x90, 0x09})
+	require.NoError(t, err)
+	// OBU payload is 07 08 09: 3 bytes (the 0x20 header is excluded from the size).
+	assert.Equal(t, []byte{0x22, 0x03, 0x07, 0x08, 0x09}, out)
+	assert.Nil(t, depacketizer.buffer)
+}
+
+// TestAV1Depacketizer_emptyFragmentAndTruncation exercises empty elements,
+// truncated length fields and the OBU-count mismatch error semantics.
+func TestAV1Depacketizer_emptyFragmentAndTruncation(t *testing.T) {
+	t.Run("empty length-prefixed element", func(t *testing.T) {
+		d := AV1Depacketizer{}
+		out, err := d.Unmarshal([]byte{0x00, 0x00})
+		require.NoError(t, err)
+		assert.Empty(t, out)
+	})
+
+	t.Run("truncated length field", func(t *testing.T) {
+		d := AV1Depacketizer{}
+		// LEB128 claims 0x99 bytes but the packet ends immediately.
+		_, err := d.Unmarshal(append([]byte{0x00}, obu.WriteToLeb128(0x99)...))
+		assert.ErrorIs(t, err, errShortPacket)
+	})
+
+	t.Run("truncated OBU header", func(t *testing.T) {
+		d := AV1Depacketizer{}
+		_, err := d.Unmarshal([]byte{0x00, 0x01, 0x04})
+		assert.Error(t, err)
+	})
+
+	t.Run("W count mismatch", func(t *testing.T) {
+		d := AV1Depacketizer{}
+		// W=3 but the packet only contains one element.
+		_, err := d.Unmarshal([]byte{0x30, 0x01, 0x00})
+		assert.ErrorIs(t, err, errShortPacket)
+	})
+
+	t.Run("short packet", func(t *testing.T) {
+		d := AV1Depacketizer{}
+		_, err := d.Unmarshal([]byte{0x00})
+		assert.ErrorIs(t, err, errShortPacket)
+	})
+}
+
+// TestAV1Depacketizer_resetDoesNotLeakState makes sure N=0/Z=0 resets and an
+// N=1 keyframe start cannot bleed one frame's fragment into the next frame.
+func TestAV1Depacketizer_resetDoesNotLeakState(t *testing.T) {
+	t.Run("non-continuation drops stale fragment", func(t *testing.T) {
+		d := AV1Depacketizer{}
+		_, err := d.Unmarshal([]byte{0x50, 0x20, 0x01, 0x02})
+		require.NoError(t, err)
+		require.NotEmpty(t, d.buffer)
+
+		// Z=0 starts a fresh OBU; the stale fragment must be discarded.
+		newOBU, expected := createAV1OBU(obu.OBUTileGroup, []byte{0x04, 0x05})
+		pkt := append([]byte{0x00}, obu.WriteToLeb128(uint(len(newOBU)))...)
+		pkt = append(pkt, newOBU...)
+		out, err := d.Unmarshal(pkt)
+		require.NoError(t, err)
+		assert.Equal(t, expected, out)
+		assert.Nil(t, d.buffer)
+	})
+
+	t.Run("N bit clears fragment and starts new coded video sequence", func(t *testing.T) {
+		d := AV1Depacketizer{}
+		_, err := d.Unmarshal([]byte{0x50, 0x20, 0x01, 0x02})
+		require.NoError(t, err)
+		require.NotEmpty(t, d.buffer)
+
+		newOBU, expected := createAV1OBU(obu.OBUTileGroup, []byte{0x06})
+		// N=1, Z=0, W=0
+		pkt := append([]byte{0x08}, obu.WriteToLeb128(uint(len(newOBU)))...)
+		pkt = append(pkt, newOBU...)
+		out, err := d.Unmarshal(pkt)
+		require.NoError(t, err)
+		assert.Equal(t, expected, out)
+		assert.True(t, d.N)
+		assert.Nil(t, d.buffer)
+	})
+
+	t.Run("two small frames back to back", func(t *testing.T) {
+		d := AV1Depacketizer{}
+		obu1, expected1 := createAV1OBU(obu.OBUTileGroup, []byte{0x01, 0x02})
+		obu2, expected2 := createAV1OBU(obu.OBUTileGroup, []byte{0x03, 0x04})
+
+		pkt1 := append([]byte{0x10}, obu1...)
+		out1, err := d.Unmarshal(pkt1)
+		require.NoError(t, err)
+		assert.Equal(t, expected1, out1)
+
+		pkt2 := append([]byte{0x10}, obu2...)
+		out2, err := d.Unmarshal(pkt2)
+		require.NoError(t, err)
+		assert.Equal(t, expected2, out2)
+		assert.Equal(t, expected1, out1, "first frame output must remain stable")
+		assert.Nil(t, d.buffer)
+	})
 }

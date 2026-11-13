@@ -12,7 +12,18 @@ import (
 // AV1Depacketizer is a AV1 RTP Packet depacketizer.
 // Reads AV1 packets from a RTP stream and outputs AV1 low overhead bitstream.
 type AV1Depacketizer struct {
-	// holds the fragmented OBU from the previous packet.
+	// buffer holds the OBU fragment that is being reassembled across packets.
+	//
+	// Ownership contract:
+	//   - The buffer is owned exclusively by the depacketizer. It never aliases
+	//     a payload handed to Unmarshal or a slice returned from it, so reusing
+	//     the input packet or retaining a previous result cannot corrupt the
+	//     in-progress fragment.
+	//   - It is grown with append. A fragment spread over many packets therefore
+	//     needs only O(log n) reallocations and O(n) copied bytes instead of
+	//     O(n^2), and its capacity is reused by the next frame once completed.
+	//   - A fragment is copied only while it has to be preserved across calls.
+	//     An OBU completed inside a single packet is emitted without an extra copy.
 	buffer []byte
 
 	// Z, Y, N are flags from the AV1 Aggregation Header.
@@ -104,10 +115,15 @@ func (d *AV1Depacketizer) Unmarshal(payload []byte) (buff []byte, err error) {
 			)
 		}
 
+		// owned marks obuBuffer as a slice of the depacketizer's own reassembly
+		// buffer rather than a sub-slice of the caller's payload. An owned
+		// buffer can be handed back to d.buffer or emitted without a copy; a
+		// payload slice must be copied before it escapes the call.
 		var obuBuffer []byte
+		owned := false
 		if isFirst && obuZ {
-			// We lost the first fragment of the OBU
-			// We drop the buffer and continue
+			// Continuation of the OBU fragment reassembled from earlier packets.
+			// We lost the first fragment of the OBU: drop the buffer and continue.
 			if len(d.buffer) == 0 {
 				if isLast {
 					break
@@ -117,19 +133,29 @@ func (d *AV1Depacketizer) Unmarshal(payload []byte) (buff []byte, err error) {
 				continue
 			}
 
+			// append grows the owned buffer geometrically, so a fragment spread
+			// over many packets reallocates only O(log n) times and copies
+			// O(n) bytes in total instead of O(n^2).
 			d.buffer = append(d.buffer, payload[offset:offset+lengthField]...)
 			obuBuffer = d.buffer
+			// Ownership moves from d.buffer into obuBuffer for this call; either
+			// the completed OBU is emitted below or the fragment is retained.
 			d.buffer = nil
+			owned = true
 		} else {
 			obuBuffer = payload[offset : offset+lengthField]
 		}
 		offset += lengthField
 
 		if isLast && obuY {
-			if !isFirst || !obuZ {
-				obuBuffer = append([]byte(nil), obuBuffer...)
+			// The fragment has to survive until the next packet. An owned buffer
+			// is transferred back directly; a payload slice aliases the input
+			// packet and must be copied, since the caller may reuse that memory.
+			if owned {
+				d.buffer = obuBuffer
+			} else {
+				d.buffer = append(d.buffer[:0], obuBuffer...)
 			}
-			d.buffer = obuBuffer
 
 			break
 		}

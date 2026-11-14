@@ -558,7 +558,12 @@ func marshalPayloadAndPaddingTo(buf []byte, offset int, header *Header, payload 
 	m := copy(buf[offset:], payload)
 
 	if header.Padding {
-		buf[offset+m+int(paddingSize-1)] = paddingSize
+		// RFC 3550: all padding bytes must be zero except the last one,
+		// which carries the padding count. Zero the region explicitly so
+		// reused buffers don't leak stale media data into the padding.
+		paddingStart := offset + m
+		clear(buf[paddingStart : paddingStart+int(paddingSize)-1])
+		buf[paddingStart+int(paddingSize-1)] = paddingSize
 	}
 
 	return offset + m + int(paddingSize), nil

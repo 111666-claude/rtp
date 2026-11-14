@@ -5,6 +5,7 @@ package rtp
 
 import (
 	"fmt"
+	"io"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -1503,6 +1504,195 @@ func TestDeprecatedPaddingSizeField(t *testing.T) {
 	parsedPacket2 := parsedPacket.Clone()
 	assert.EqualValues(t, 5, parsedPacket2.PaddingSize)
 	assert.EqualValues(t, 0, parsedPacket2.Header.PaddingSize)
+}
+
+// TestMarshalPaddingZeroesReusedBuffer verifies that marshaling into a reused
+// (dirty) buffer zeroes the RTP padding region exactly like a freshly
+// allocated buffer does, for all serialization entry points.
+func TestMarshalPaddingZeroesReusedBuffer(t *testing.T) {
+	const (
+		staleByte = 0xa5
+		tailGuard = 16
+	)
+
+	payload := []byte{0x01, 0x02, 0x03, 0x04, 0x05}
+
+	newPacket := func(paddingSize byte, payload []byte) *Packet {
+		return &Packet{
+			Header: Header{
+				Version:        2,
+				Padding:        paddingSize > 0,
+				Marker:         true,
+				PayloadType:    96,
+				SequenceNumber: 27023,
+				Timestamp:      3653407706,
+				SSRC:           476325762,
+				PaddingSize:    paddingSize,
+			},
+			Payload: payload,
+		}
+	}
+
+	dirtyBuf := func(size int) []byte {
+		buf := make([]byte, size)
+		for i := range buf {
+			buf[i] = staleByte
+		}
+
+		return buf
+	}
+
+	// check verifies a marshaled packet in buf[:n] against the fresh-alloc
+	// reference, the zero padding region, and the untouched tail guard.
+	check := func(t *testing.T, want []byte, buf []byte, n int, paddingSize byte) {
+		t.Helper()
+		assert.Equal(t, len(want), n)
+		assert.Equal(t, want, buf[:n], "reused-buffer marshal must match fresh-alloc marshal")
+		if paddingSize > 0 {
+			padStart := n - int(paddingSize)
+			for i := padStart; i < n-1; i++ {
+				assert.Zero(t, buf[i], "padding byte %d must be zero", i-padStart)
+			}
+			assert.Equal(t, paddingSize, buf[n-1], "last padding byte must be the padding count")
+		}
+		for i := n; i < len(buf); i++ {
+			assert.Equal(t, byte(staleByte), buf[i], "byte %d past packet end must stay untouched", i-n)
+		}
+	}
+
+	for _, paddingSize := range []byte{1, 4, 255} {
+		paddingSize := paddingSize
+		name := fmt.Sprintf("paddingSize=%d", paddingSize)
+
+		t.Run(name+"/Packet.MarshalTo", func(t *testing.T) {
+			pkt := newPacket(paddingSize, payload)
+			payloadCopy := append([]byte(nil), payload...)
+			want, err := pkt.Marshal()
+			assert.NoError(t, err)
+
+			buf := dirtyBuf(len(want) + tailGuard)
+			n, err := pkt.MarshalTo(buf)
+			assert.NoError(t, err)
+			check(t, want, buf, n, paddingSize)
+			assert.Equal(t, payloadCopy, pkt.Payload, "caller payload must not be modified")
+		})
+
+		t.Run(name+"/MarshalPacketTo", func(t *testing.T) {
+			pkt := newPacket(paddingSize, payload)
+			payloadCopy := append([]byte(nil), payload...)
+			want, err := pkt.Marshal()
+			assert.NoError(t, err)
+
+			buf := dirtyBuf(len(want) + tailGuard)
+			n, err := MarshalPacketTo(buf, &pkt.Header, pkt.Payload)
+			assert.NoError(t, err)
+			check(t, want, buf, n, paddingSize)
+			assert.Equal(t, payloadCopy, pkt.Payload, "caller payload must not be modified")
+		})
+
+		t.Run(name+"/DeprecatedPaddingSizeField", func(t *testing.T) {
+			pkt := newPacket(paddingSize, payload)
+			pkt.Header.PaddingSize = 0
+			pkt.PaddingSize = paddingSize
+			want, err := pkt.Marshal()
+			assert.NoError(t, err)
+
+			buf := dirtyBuf(len(want) + tailGuard)
+			n, err := pkt.MarshalTo(buf)
+			assert.NoError(t, err)
+			check(t, want, buf, n, paddingSize)
+		})
+
+		t.Run(name+"/EmptyPayload", func(t *testing.T) {
+			pkt := newPacket(paddingSize, nil)
+			want, err := pkt.Marshal()
+			assert.NoError(t, err)
+
+			buf := dirtyBuf(len(want) + tailGuard)
+			n, err := pkt.MarshalTo(buf)
+			assert.NoError(t, err)
+			check(t, want, buf, n, paddingSize)
+		})
+
+		t.Run(name+"/ShortBuffer", func(t *testing.T) {
+			pkt := newPacket(paddingSize, payload)
+			size := pkt.MarshalSize()
+			_, err := pkt.MarshalTo(dirtyBuf(size - 1))
+			assert.ErrorIs(t, err, io.ErrShortBuffer)
+
+			_, err = MarshalPacketTo(dirtyBuf(size-1), &pkt.Header, pkt.Payload)
+			assert.ErrorIs(t, err, io.ErrShortBuffer)
+		})
+	}
+
+	t.Run("NoPadding", func(t *testing.T) {
+		pkt := newPacket(0, payload)
+		want, err := pkt.Marshal()
+		assert.NoError(t, err)
+
+		buf := dirtyBuf(len(want) + tailGuard)
+		n, err := pkt.MarshalTo(buf)
+		assert.NoError(t, err)
+		check(t, want, buf, n, 0)
+
+		buf = dirtyBuf(len(want) + tailGuard)
+		n, err = MarshalPacketTo(buf, &pkt.Header, pkt.Payload)
+		assert.NoError(t, err)
+		check(t, want, buf, n, 0)
+	})
+
+	t.Run("ExactSizeBuffer", func(t *testing.T) {
+		pkt := newPacket(4, payload)
+		want, err := pkt.Marshal()
+		assert.NoError(t, err)
+
+		buf := dirtyBuf(len(want))
+		n, err := pkt.MarshalTo(buf)
+		assert.NoError(t, err)
+		assert.Equal(t, len(want), n)
+		assert.Equal(t, want, buf)
+	})
+
+	// Reused-buffer marshaling of many fixed-size packets must stay linear:
+	// every packet's padding region is zeroed independently of prior packets.
+	t.Run("ReuseStaysConsistent", func(t *testing.T) {
+		const packets = 10000
+		pkt := newPacket(4, payload)
+		want, err := pkt.Marshal()
+		assert.NoError(t, err)
+
+		buf := make([]byte, len(want))
+		for i := 0; i < packets; i++ {
+			for j := range buf {
+				buf[j] = staleByte
+			}
+			n, err := pkt.MarshalTo(buf)
+			assert.NoError(t, err)
+			assert.Equal(t, want, buf[:n])
+		}
+	})
+}
+
+func BenchmarkMarshalToPaddingReuse(b *testing.B) {
+	pkt := &Packet{
+		Header: Header{
+			Version:        2,
+			Padding:        true,
+			PayloadType:    96,
+			SequenceNumber: 27023,
+			Timestamp:      3653407706,
+			SSRC:           476325762,
+			PaddingSize:    4,
+		},
+		Payload: make([]byte, 1200),
+	}
+	buf := make([]byte, pkt.MarshalSize())
+
+	for b.Loop() {
+		if _, err := pkt.MarshalTo(buf); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 func TestSetExtensionWithProfile(t *testing.T) {

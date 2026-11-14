@@ -641,9 +641,13 @@ func (d *H266Depacketizer) Unmarshal(packet []byte) ([]byte, error) { //nolint: 
 
 	parsedHeader := newH266NALUHeader(packet[0], packet[1])
 
-	// we are expecting another FU but only the first FU of a series has the DONL field present
+	// DONL is present in every non-FU packet, and in a FU only when its S bit
+	// is set (RFC 9328 section 4.3.3). Decide from the packet itself rather than
+	// leftover fragmentation state, so a FU series starting right after another
+	// packet type is still parsed correctly.
 	isFrag := parsedHeader.IsFragmentationUnit()
-	parseDonl := d.hasDonl && ((len(d.partials) == 0 && isFrag) || !isFrag)
+	parseDonl := d.hasDonl &&
+		(!isFrag || (len(packet) > h266NaluHeaderSize && h266FragmentationUnitHeader(packet[h266NaluHeaderSize]).S()))
 
 	parsed, err := parseH266Packet(packet, parseDonl)
 	if err != nil {
@@ -662,6 +666,8 @@ func (d *H266Depacketizer) Unmarshal(packet []byte) ([]byte, error) { //nolint: 
 			if err != nil {
 				return nil, err
 			}
+			// DONL is an RTP transport field, it must not appear in the Annex-B output
+			rebuilt.donl = nil
 			output = append(output, rebuilt.packetize(make([]byte, 0))...)
 			d.partials = d.partials[:0]
 
@@ -689,6 +695,8 @@ func (d *H266Depacketizer) Unmarshal(packet []byte) ([]byte, error) { //nolint: 
 			return nil, err
 		}
 		for _, p := range aggregated {
+			// DONL is an RTP transport field, it must not appear in the Annex-B output
+			p.donl = nil
 			output = append(output, annexbNALUStartCode...)
 			output = p.packetize(output)
 		}
@@ -702,6 +710,8 @@ func (d *H266Depacketizer) Unmarshal(packet []byte) ([]byte, error) { //nolint: 
 		return nil, errNalCorrupted
 	}
 
+	// DONL is an RTP transport field, it must not appear in the Annex-B output
+	single.donl = nil
 	output = single.packetize(output)
 
 	return output, nil

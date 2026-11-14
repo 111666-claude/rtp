@@ -539,8 +539,10 @@ func TestH266Depacketizer_Roundtrip(t *testing.T) {
 				continue
 			}
 
+			// the depacketizer output is Annex-B and must never contain the
+			// transport-only DONL field, even when the stream carries it
 			emitH266Nalus(p, func(b []byte) {
-				parsed, err := parseH266Packet(b, withDonl)
+				parsed, err := parseH266Packet(b, false)
 				assert.Nil(t, err)
 				if err != nil {
 					return
@@ -549,6 +551,13 @@ func TestH266Depacketizer_Roundtrip(t *testing.T) {
 			})
 		}
 		assert.Equal(t, expected, output)
+	}
+
+	withoutDonl := func(p *h266SingleNALUnitPacket) *h266SingleNALUnitPacket {
+		cpy := *p
+		cpy.donl = nil
+
+		return &cpy
 	}
 
 	testDonl := uint16(100)
@@ -568,7 +577,7 @@ func TestH266Depacketizer_Roundtrip(t *testing.T) {
 
 	basicPacket.donl = &testDonl
 
-	testDepacketizer([][]byte{basicPacket.packetize(make([]byte, 0))}, []isH266Packet{basicPacket}, true)
+	testDepacketizer([][]byte{basicPacket.packetize(make([]byte, 0))}, []isH266Packet{withoutDonl(basicPacket)}, true)
 
 	// Multiple NALs aggregated
 
@@ -599,7 +608,11 @@ func TestH266Depacketizer_Roundtrip(t *testing.T) {
 	assert.Nil(t, err)
 	donlAggregationPacketized := donlAggregation.packetize(make([]byte, 0))
 
-	testDepacketizer([][]byte{donlAggregationPacketized}, []isH266Packet{firstPacket, secondPacket}, true)
+	testDepacketizer(
+		[][]byte{donlAggregationPacketized},
+		[]isH266Packet{withoutDonl(firstPacket), withoutDonl(secondPacket)},
+		true,
+	)
 
 	// Large NAL that gets fragmented
 
@@ -636,5 +649,159 @@ func TestH266Depacketizer_Roundtrip(t *testing.T) {
 		donlFragmentsPacketized = append(donlFragmentsPacketized, f.packetize(make([]byte, 0)))
 	}
 
-	testDepacketizer(donlFragmentsPacketized, []isH266Packet{largePacket}, true)
+	testDepacketizer(donlFragmentsPacketized, []isH266Packet{withoutDonl(largePacket)}, true)
+}
+
+func TestH266Depacketizer_DONLStrippedAllPaths(t *testing.T) {
+	donl := uint16(42)
+	header := createTestH266Header(1, 0, 1, false, false)
+	payload := make([]byte, 0, 300)
+	for i := 0; i < 300; i++ {
+		payload = append(payload, uint8(i)) // nolint:gosec
+	}
+
+	nalu := h266SingleNALUnitPacket{header, &donl, payload}
+
+	// the expected Annex-B output: start code + NALU header + payload, no DONL
+	expectedNalu := (&h266SingleNALUnitPacket{header, nil, payload}).packetize(make([]byte, 0))
+	expectedAnnexB := append(append(make([]byte, 0), annexbNALUStartCode...), expectedNalu...)
+
+	// Single NAL unit packet
+	singleDepacketizer := H266Depacketizer{hasDonl: true}
+	singleOut, err := singleDepacketizer.Unmarshal(nalu.packetize(make([]byte, 0)))
+	assert.Nil(t, err)
+	assert.Equal(t, expectedAnnexB, singleOut, "single NALU output must not contain the DONL field")
+
+	// Aggregation packet containing the same NALU twice
+	aggregation, err := newH266AggregationPacket([]h266SingleNALUnitPacket{nalu, nalu})
+	assert.Nil(t, err)
+	apDepacketizer := H266Depacketizer{hasDonl: true}
+	apOut, err := apDepacketizer.Unmarshal(aggregation.packetize(make([]byte, 0)))
+	assert.Nil(t, err)
+	expectedAP := append(append(make([]byte, 0), expectedAnnexB...), expectedAnnexB...)
+	assert.Equal(t, expectedAP, apOut, "aggregation output must not contain DONL fields")
+
+	// Fragmentation units reassembling the same NALU
+	fragments, err := newH266FragmentationPackets(100, &nalu)
+	assert.Nil(t, err)
+	assert.Greater(t, len(fragments), 1, "expected the NALU to be split into multiple FUs")
+	fuDepacketizer := H266Depacketizer{hasDonl: true}
+	var fuOut []byte
+	for i, f := range fragments {
+		out, err := fuDepacketizer.Unmarshal(f.packetize(make([]byte, 0)))
+		assert.Nil(t, err)
+		if i < len(fragments)-1 {
+			assert.Nil(t, out, "FU must only produce output once complete")
+		} else {
+			fuOut = out
+		}
+	}
+	assert.Equal(t, expectedAnnexB, fuOut, "rebuilt FU output must not contain the DONL field")
+
+	// all three paths must yield identical media content
+	assert.Equal(t, singleOut, fuOut, "single and FU paths must produce identical Annex-B output")
+}
+
+func TestH266Depacketizer_TruncatedDONL(t *testing.T) {
+	depacketizer := H266Depacketizer{hasDonl: true}
+
+	// single NALU with no room for the DONL field
+	_, err := depacketizer.Unmarshal([]byte{0x00, 0x01})
+	assert.ErrorIs(t, err, errShortPacket)
+
+	// single NALU with a truncated DONL field
+	_, err = depacketizer.Unmarshal([]byte{0x00, 0x01, 0x05})
+	assert.ErrorIs(t, err, errShortPacket)
+
+	// aggregation packet with a truncated DONL field
+	apHeader := createTestH266Header(h266NaluAggregationPacketType, 0, 0, false, false)
+	_, err = depacketizer.Unmarshal([]byte{byte(uint16(apHeader) >> 8), byte(uint16(apHeader)), 0x05})
+	assert.ErrorIs(t, err, errShortPacket)
+
+	// fragmentation unit with S bit set but a truncated DONL field
+	fuPayloadHeader := newH266FragmentationPacketHeader(createTestH266Header(1, 0, 1, false, false))
+	fuHeader := newH266FragmentationUnitHeader(createTestH266Header(1, 0, 1, false, false), true, false, false)
+	_, err = depacketizer.Unmarshal([]byte{byte(uint16(fuPayloadHeader) >> 8), byte(uint16(fuPayloadHeader)), uint8(fuHeader), 0x05})
+	assert.ErrorIs(t, err, errShortPacket)
+
+	// non-start FU without any partials must keep returning the existing error
+	middleFu := h266FragmentationPacket{
+		payloadHeader: fuPayloadHeader,
+		fuHeader:      newH266FragmentationUnitHeader(createTestH266Header(1, 0, 1, false, false), false, false, false),
+		payload:       []byte{0x01, 0x02},
+	}
+	_, err = depacketizer.Unmarshal(middleFu.packetize(make([]byte, 0)))
+	assert.ErrorIs(t, err, errExpectFragmentationStartUnit)
+}
+
+func TestH266Depacketizer_NoResidualDONLState(t *testing.T) {
+	depacketizer := H266Depacketizer{hasDonl: true}
+	header := createTestH266Header(1, 0, 1, false, false)
+	fuPayloadHeader := newH266FragmentationPacketHeader(header)
+	donl1 := uint16(5)
+	donl2 := uint16(7)
+
+	startFu := func(donl *uint16, payload []byte) *h266FragmentationPacket {
+		return &h266FragmentationPacket{
+			payloadHeader: fuPayloadHeader,
+			fuHeader:      newH266FragmentationUnitHeader(header, true, false, false),
+			donl:          donl,
+			payload:       payload,
+		}
+	}
+	endFu := func(payload []byte) *h266FragmentationPacket {
+		return &h266FragmentationPacket{
+			payloadHeader: fuPayloadHeader,
+			fuHeader:      newH266FragmentationUnitHeader(header, false, true, false),
+			payload:       payload,
+		}
+	}
+
+	// an abandoned FU series must not make the next series' DONL be
+	// misinterpreted as payload
+	out, err := depacketizer.Unmarshal(startFu(&donl1, []byte{0xaa}).packetize(make([]byte, 0)))
+	assert.Nil(t, err)
+	assert.Nil(t, out)
+
+	out, err = depacketizer.Unmarshal(startFu(&donl2, []byte{0xbb}).packetize(make([]byte, 0)))
+	assert.Nil(t, err)
+	assert.Nil(t, out)
+
+	out, err = depacketizer.Unmarshal(endFu([]byte{0xcc}).packetize(make([]byte, 0)))
+	assert.Nil(t, err)
+	expected := (&h266SingleNALUnitPacket{header, nil, []byte{0xbb, 0xcc}}).packetize(make([]byte, 0))
+	assert.Equal(t, append(annexbNALUStartCode, expected...), out)
+
+	// a single NALU in the middle of a FU series resets the series and is
+	// output with its own DONL removed
+	out, err = depacketizer.Unmarshal(startFu(&donl1, []byte{0xaa}).packetize(make([]byte, 0)))
+	assert.Nil(t, err)
+	assert.Nil(t, out)
+
+	single := h266SingleNALUnitPacket{createTestH266Header(0, 0, 0, false, false), &donl1, []byte{0x01, 0x02, 0x03}}
+	out, err = depacketizer.Unmarshal(single.packetize(make([]byte, 0)))
+	assert.Nil(t, err)
+	expectedSingle := (&h266SingleNALUnitPacket{single.payloadHeader, nil, single.payload}).packetize(make([]byte, 0))
+	assert.Equal(t, append(annexbNALUStartCode, expectedSingle...), out)
+
+	// a FU series started right after still parses its DONL correctly
+	out, err = depacketizer.Unmarshal(startFu(&donl2, []byte{0xbb}).packetize(make([]byte, 0)))
+	assert.Nil(t, err)
+	assert.Nil(t, out)
+
+	out, err = depacketizer.Unmarshal(endFu([]byte{0xcc}).packetize(make([]byte, 0)))
+	assert.Nil(t, err)
+	assert.Equal(t, append(annexbNALUStartCode, expected...), out)
+}
+
+func TestH266Depacketizer_NoDONLBytesPreserved(t *testing.T) {
+	depacketizer := H266Depacketizer{hasDonl: false}
+
+	header := createTestH266Header(1, 2, 3, false, false)
+	payload := []byte{0xde, 0xad, 0xbe, 0xef}
+	raw := (&h266SingleNALUnitPacket{header, nil, payload}).packetize(make([]byte, 0))
+
+	out, err := depacketizer.Unmarshal(raw)
+	assert.Nil(t, err)
+	assert.Equal(t, append(annexbNALUStartCode, raw...), out, "output must keep the original header and payload bytes")
 }

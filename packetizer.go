@@ -112,9 +112,15 @@ func (p *packetizer) EnableAbsSendTime(value int) {
 }
 
 // Packetize packetizes the payload of an RTP packet and returns one or more RTP packets.
+// An empty payload produces no packets and consumes no sequence numbers, but it still advances the
+// packetizer timestamp by samples, because the samples were consumed from the stream nonetheless.
 func (p *packetizer) Packetize(payload []byte, samples uint32) []*Packet {
 	// Guard against an empty payload
 	if len(payload) == 0 {
+		// No packet is emitted, but the requested samples still elapsed on the stream.
+		// Advancing the timestamp keeps later packets in sync with the sample clock.
+		p.Timestamp += samples
+
 		return nil
 	}
 

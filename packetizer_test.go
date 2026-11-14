@@ -5,12 +5,216 @@ package rtp
 
 import (
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
 	"github.com/pion/rtp/codecs"
 	"github.com/stretchr/testify/assert"
 )
+
+// newTestPacketizer builds a packetizer with a deterministic timestamp and sequence number.
+func newTestPacketizer(
+	t *testing.T, mtu uint16, payloader Payloader, timestamp uint32, seq uint16,
+) *packetizer {
+	t.Helper()
+
+	pktizer := NewPacketizerWithOptions(
+		mtu,
+		payloader,
+		NewFixedSequencer(seq),
+		90000,
+		WithTimestamp(timestamp),
+		WithPayloadType(98),
+		WithSSRC(0x1234ABCD),
+	)
+	p, ok := pktizer.(*packetizer)
+	assert.True(t, ok, "Failed to cast to *packetizer")
+
+	return p
+}
+
+func TestPacketizer_EmptyPayloadAdvancesTimestamp(t *testing.T) {
+	const (
+		startTS = uint32(1000)
+		samples = uint32(2000)
+	)
+
+	packetizer := newTestPacketizer(t, 100, &codecs.G722Payloader{}, startTS, 1234)
+	payload := []byte{0x11, 0x12, 0x13, 0x14}
+
+	// Empty call: no packets, but 2000 samples elapsed.
+	assert.Nil(t, packetizer.Packetize(nil, samples), "Empty payload must produce zero packets")
+	assert.Equal(t, startTS+samples, packetizer.Timestamp, "Empty payload must advance the timestamp")
+
+	// First non-empty packet: timestamp reflects the preceding empty frame.
+	packets1 := packetizer.Packetize(payload, samples)
+	assert.Len(t, packets1, 1)
+	assert.Equal(t, startTS+samples, packets1[0].Timestamp)
+	assert.Equal(t, uint16(1234), packets1[0].SequenceNumber, "Empty payload must not consume a sequence number")
+
+	// Another empty call must advance the clock again.
+	assert.Nil(t, packetizer.Packetize(nil, samples))
+	assert.Equal(t, startTS+3*samples, packetizer.Timestamp)
+
+	// The gap between the two non-empty packets is 2 * 2000 samples, not 2000.
+	packets2 := packetizer.Packetize(payload, samples)
+	assert.Len(t, packets2, 1)
+	assert.Equal(t, startTS+3*samples, packets2[0].Timestamp)
+	assert.Equal(t, uint16(1235), packets2[0].SequenceNumber)
+	assert.Equal(t, uint32(4000), packets2[0].Timestamp-packets1[0].Timestamp)
+
+	// Payloaders and header fields are untouched for non-empty payloads.
+	assert.Equal(t, payload, packets2[0].Payload)
+	assert.Equal(t, uint8(98), packets2[0].PayloadType)
+	assert.Equal(t, uint32(0x1234ABCD), packets2[0].SSRC)
+	assert.True(t, packets2[0].Marker, "The last/only packet of a payload keeps its marker bit")
+}
+
+func TestPacketizer_EmptyPayloadTimestampEdges(t *testing.T) {
+	payload := []byte{0x11, 0x12, 0x13, 0x14}
+
+	t.Run("empty slice is treated like nil", func(t *testing.T) {
+		packetizer := newTestPacketizer(t, 100, &codecs.G722Payloader{}, 1000, 1)
+		assert.Nil(t, packetizer.Packetize([]byte{}, 2000))
+		assert.Equal(t, uint32(3000), packetizer.Timestamp)
+	})
+
+	t.Run("zero samples does not move timestamp", func(t *testing.T) {
+		packetizer := newTestPacketizer(t, 100, &codecs.G722Payloader{}, 1000, 1)
+		assert.Nil(t, packetizer.Packetize(nil, 0))
+		assert.Equal(t, uint32(1000), packetizer.Timestamp)
+
+		packets := packetizer.Packetize(payload, 0)
+		assert.Len(t, packets, 1)
+		assert.Equal(t, uint32(1000), packets[0].Timestamp)
+	})
+
+	t.Run("consecutive empty payloads accumulate", func(t *testing.T) {
+		packetizer := newTestPacketizer(t, 100, &codecs.G722Payloader{}, 1000, 1)
+		for i := 0; i < 5; i++ {
+			assert.Nil(t, packetizer.Packetize(nil, 2000))
+		}
+		assert.Equal(t, uint32(1000+5*2000), packetizer.Timestamp)
+
+		packets := packetizer.Packetize(payload, 2000)
+		assert.Len(t, packets, 1)
+		assert.Equal(t, uint32(1000+5*2000), packets[0].Timestamp)
+	})
+
+	t.Run("large samples wrap without allocation or panic", func(t *testing.T) {
+		packetizer := newTestPacketizer(t, 100, &codecs.G722Payloader{}, 1000, 1)
+		assert.Nil(t, packetizer.Packetize(nil, math.MaxUint32))
+		assert.Equal(t, uint32(999), packetizer.Timestamp)
+
+		assert.Nil(t, packetizer.Packetize(nil, math.MaxUint32))
+		assert.Equal(t, uint32(998), packetizer.Timestamp)
+
+		packets := packetizer.Packetize(payload, 2)
+		assert.Len(t, packets, 1)
+		// Use variables so the addition wraps at runtime instead of failing as a constant overflow.
+		// The packet carries the timestamp before the final two samples are consumed.
+		start := uint32(1000)
+		maxTS := uint32(math.MaxUint32)
+		assert.Equal(t, start+maxTS+maxTS, packets[0].Timestamp)
+	})
+
+	t.Run("uint32 wraparound is preserved across empty frames", func(t *testing.T) {
+		packetizer := newTestPacketizer(t, 100, &codecs.G722Payloader{}, 0xFFFFFF00, 1)
+
+		// 0xFFFFFF00 + 2000 wraps to 1744.
+		assert.Nil(t, packetizer.Packetize(nil, 2000))
+		assert.Equal(t, uint32(1744), packetizer.Timestamp)
+
+		assert.Nil(t, packetizer.Packetize(nil, 2000))
+		assert.Equal(t, uint32(3744), packetizer.Timestamp)
+
+		packets := packetizer.Packetize(payload, 2000)
+		assert.Len(t, packets, 1)
+		assert.Equal(t, uint32(3744), packets[0].Timestamp)
+	})
+}
+
+func TestPacketizer_EmptyPayloadSequenceAndFragmentationUnchanged(t *testing.T) {
+	packetizer := newTestPacketizer(t, 100, &codecs.G722Payloader{}, 0, 1234)
+	makePayload := func() []byte { return make([]byte, 128) }
+
+	empty := packetizer.Packetize(nil, 2000)
+	assert.Nil(t, empty, "Empty payload must produce exactly zero packets")
+
+	// G722 fragmentation for MTU 100 (88 byte payloads) is unchanged: 88 + 40 bytes.
+	packets := packetizer.Packetize(makePayload(), 2000)
+	assert.Len(t, packets, 2)
+	assert.Equal(t, uint32(2000), packets[0].Timestamp)
+	assert.Equal(t, uint32(2000), packets[1].Timestamp)
+	assert.False(t, packets[0].Marker)
+	assert.True(t, packets[1].Marker)
+	assert.Equal(t, uint16(1234), packets[0].SequenceNumber)
+	assert.Equal(t, uint16(1235), packets[1].SequenceNumber)
+	assert.Equal(t, uint32(0x1234ABCD), packets[0].SSRC)
+}
+
+func TestPacketizer_EmptyPayloadAllPayloaders(t *testing.T) {
+	payloaders := []struct {
+		name      string
+		payloader Payloader
+	}{
+		{"G711", &codecs.G711Payloader{}},
+		{"G722", &codecs.G722Payloader{}},
+		{"H264", &codecs.H264Payloader{}},
+		{"H265", &codecs.H265Payloader{}},
+		{"VP8", &codecs.VP8Payloader{}},
+		{"VP9", &codecs.VP9Payloader{}},
+		{"AV1", &codecs.AV1Payloader{}},
+	}
+
+	for _, tc := range payloaders {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			packetizer := newTestPacketizer(t, 1200, tc.payloader, 100, 7)
+
+			assert.Nil(t, packetizer.Packetize(nil, 2000))
+			assert.Equal(t, uint32(2100), packetizer.Timestamp)
+
+			assert.Nil(t, packetizer.Packetize(nil, 3000))
+			assert.Equal(t, uint32(5100), packetizer.Timestamp)
+
+			// No sequence numbers were consumed by the empty calls.
+			assert.Equal(t, uint16(7), packetizer.Sequencer.NextSequenceNumber())
+		})
+	}
+}
+
+func TestPacketizer_EmptyPayloadAllocationFree(t *testing.T) {
+	packetizer := newTestPacketizer(t, 1200, &codecs.G722Payloader{}, 0, 0)
+
+	allocs := testing.AllocsPerRun(100, func() {
+		assert.Nil(t, packetizer.Packetize(nil, math.MaxUint32))
+	})
+	assert.Zero(t, allocs, "Empty payload must not allocate")
+}
+
+func TestPacketizer_SkipSamplesThenEmptyPayload(t *testing.T) {
+	packetizer := newTestPacketizer(t, 100, &codecs.G722Payloader{}, 5000, 1000)
+	packetizer.EnableAbsSendTime(1)
+	packetizer.timegen = func() time.Time {
+		return time.Date(1985, time.June, 23, 4, 0, 0, 0, time.FixedZone("UTC-5", -5*60*60))
+	}
+
+	packetizer.SkipSamples(700)
+	assert.Nil(t, packetizer.Packetize(nil, 2000))
+	assert.Equal(t, uint32(5000+700+2000), packetizer.Timestamp)
+
+	packets := packetizer.Packetize([]byte{0x11, 0x12, 0x13, 0x14}, 2000)
+	assert.Len(t, packets, 1)
+	assert.Equal(t, uint32(5000+700+2000), packets[0].Timestamp)
+	assert.Equal(t, uint16(1000), packets[0].SequenceNumber)
+	assert.Equal(t, uint32(0x1234ABCD), packets[0].SSRC)
+	assert.Equal(t, uint8(98), packets[0].PayloadType)
+	assert.True(t, packets[0].Extension, "AbsSendTime option must still be applied after SkipSamples + empty payload")
+	assert.Len(t, packets[0].Extensions, 1)
+	assert.Equal(t, uint32(5000+700+2*2000), packetizer.Timestamp)
+}
 
 func TestPacketizer(t *testing.T) {
 	multiplepayload := make([]byte, 128)
@@ -196,7 +400,7 @@ func FuzzPacketizer_Packetize_G722(f *testing.F) {
 			payload = payload[:1<<16]
 		}
 
-		packetizer := NewPacketizerWithOptions(
+		pkts := NewPacketizerWithOptions(
 			mtu,
 			&codecs.G722Payloader{},
 			NewFixedSequencer(0),
@@ -207,10 +411,15 @@ func FuzzPacketizer_Packetize_G722(f *testing.F) {
 		)
 
 		if enableAST {
-			packetizer.EnableAbsSendTime(1)
+			pkts.EnableAbsSendTime(1)
 		}
 
-		packets := packetizer.Packetize(payload, samples)
+		packets := pkts.Packetize(payload, samples)
+
+		// Every call consumes samples from the stream, whether or not it emitted packets.
+		p, ok := pkts.(*packetizer)
+		assert.True(t, ok, "Failed to cast to *packetizer")
+		assert.Equal(t, uint32(0xAABBCCDD)+samples, p.Timestamp, "Packetize must always advance the timestamp by samples")
 
 		if len(payload) == 0 {
 			assert.Nil(t, packets)
@@ -267,6 +476,8 @@ func FuzzPacketizer_SkipSamples_And_Timestamps(f *testing.F) {
 	f.Add(uint16(1200), uint32(0), uint32(480), uint32(960), uint16(100), uint16(200), false)
 	f.Add(uint16(200), uint32(160), uint32(160), uint32(160), uint16(10), uint16(20), true)
 	f.Add(uint16(20), uint32(32000), uint32(0), uint32(1), uint16(0), uint16(1), false)
+	// MTU 12 leaves no room for payload, so Packetize consumes samples without emitting packets.
+	f.Add(uint16(12), uint32(32027), uint32(0), uint32(1), uint16(94), uint16(1), false)
 
 	f.Fuzz(func(
 		t *testing.T,
@@ -305,20 +516,33 @@ func FuzzPacketizer_SkipSamples_And_Timestamps(f *testing.F) {
 
 		packetizer.SkipSamples(skip)
 
+		// An empty payload (or an MTU too small for the payloader to produce anything) emits no
+		// packets, but the samples it consumed still advance the timestamp.
+		emit1 := len(p1) != 0 && mtu != 12
+
 		pkts1 := packetizer.Packetize(p1, samples1)
-		if len(p1) == 0 {
-			assert.Nil(t, pkts1)
+		if !emit1 {
+			assert.Empty(t, pkts1)
+			if len(p1) == 0 {
+				assert.Nil(t, pkts1, "Empty payload must return nil")
+			}
 		} else {
 			assert.GreaterOrEqual(t, len(pkts1), 1)
 			assert.Equal(t, startTS+skip, pkts1[0].Timestamp)
 		}
 
+		// The first Packetize call always consumes samples1, packets emitted or not.
+		expectedTS2 := startTS + skip + samples1
+		emit2 := len(p2) != 0 && mtu != 12
+
 		pkts2 := packetizer.Packetize(p2, samples2)
-		if len(p2) == 0 {
-			assert.Nil(t, pkts2)
+		if !emit2 {
+			assert.Empty(t, pkts2)
+			if len(p2) == 0 {
+				assert.Nil(t, pkts2, "Empty payload must return nil")
+			}
 		} else {
 			assert.GreaterOrEqual(t, len(pkts2), 1)
-			expectedTS2 := startTS + skip + samples1
 			assert.Equal(t, expectedTS2, pkts2[0].Timestamp)
 		}
 

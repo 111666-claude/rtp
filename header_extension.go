@@ -186,35 +186,66 @@ func (e *TwoByteHeaderExtension) Set(id uint8, buf []byte) error {
 		return fmt.Errorf("%w actual(%d)", errRFC8285TwoByteHeaderSize, len(buf))
 	}
 
+	if len(e.payload) == 0 {
+		e.payload = []byte{0x10, 0x00, 0x00, 0x00}
+	}
+
 	for n := 4; n < len(e.payload); {
 		if e.payload[n] == 0x00 { // padding
 			n++
 
 			continue
 		}
+		if n+1 >= len(e.payload) { // truncated element header
+			break
+		}
 
 		extid := e.payload[n]
-		n++
-
-		payloadLen := int(e.payload[n])
-		n++
+		payloadLen := int(e.payload[n+1])
+		if n+2+payloadLen > len(e.payload) { // truncated element payload
+			break
+		}
 
 		if extid == id {
-			e.payload = append(e.payload[:n+2], append(buf, e.payload[n+2+payloadLen:]...)...)
+			// Replace the element in place, preserving the elements that follow it.
+			tail := append([]byte{}, e.payload[n+2+payloadLen:]...)
+			e.payload = e.payload[:n+2]
+			e.payload[n+1] = uint8(len(buf)) // nolint: gosec // G115
+			e.payload = append(e.payload, buf...)
+			e.payload = append(e.payload, tail...)
+			e.finalize()
 
 			return nil
 		}
-		n += payloadLen
+		n += payloadLen + 2
 	}
+
+	// Trim trailing padding so the new element is packed contiguously.
+	for len(e.payload) > 4 && e.payload[len(e.payload)-1] == 0x00 {
+		e.payload = e.payload[:len(e.payload)-1]
+	}
+
 	e.payload = append(e.payload, id, uint8(len(buf))) // nolint: gosec // G115
 	e.payload = append(e.payload, buf...)
-	binary.BigEndian.PutUint16(e.payload[2:4], binary.BigEndian.Uint16(e.payload[2:4])+1)
+	e.finalize()
 
 	return nil
 }
 
+// finalize pads the payload to a 32-bit boundary and updates the length field.
+func (e *TwoByteHeaderExtension) finalize() {
+	for len(e.payload)%4 != 0 {
+		e.payload = append(e.payload, 0x00)
+	}
+	binary.BigEndian.PutUint16(e.payload[2:4], uint16((len(e.payload)-4)/4)) // nolint: gosec // G115
+}
+
 // GetIDs returns the available IDs.
 func (e *TwoByteHeaderExtension) GetIDs() []uint8 {
+	if len(e.payload) < 4 {
+		return nil
+	}
+
 	ids := make([]uint8, 0, binary.BigEndian.Uint16(e.payload[2:4]))
 	for n := 4; n < len(e.payload); {
 		if e.payload[n] == 0x00 { // padding
@@ -222,15 +253,18 @@ func (e *TwoByteHeaderExtension) GetIDs() []uint8 {
 
 			continue
 		}
+		if n+1 >= len(e.payload) { // truncated element header
+			break
+		}
 
 		extid := e.payload[n]
-		n++
-
-		payloadLen := int(e.payload[n])
-		n++
+		payloadLen := int(e.payload[n+1])
+		if n+2+payloadLen > len(e.payload) { // truncated element payload
+			break
+		}
 
 		ids = append(ids, extid)
-		n += payloadLen
+		n += payloadLen + 2
 	}
 
 	return ids
@@ -244,17 +278,20 @@ func (e *TwoByteHeaderExtension) Get(id uint8) []byte {
 
 			continue
 		}
+		if n+1 >= len(e.payload) { // truncated element header
+			break
+		}
 
 		extid := e.payload[n]
-		n++
-
-		payloadLen := int(e.payload[n])
-		n++
+		payloadLen := int(e.payload[n+1])
+		if n+2+payloadLen > len(e.payload) { // truncated element payload
+			break
+		}
 
 		if extid == id {
-			return e.payload[n : n+payloadLen]
+			return e.payload[n+2 : n+2+payloadLen]
 		}
-		n += payloadLen
+		n += payloadLen + 2
 	}
 
 	return nil
@@ -268,13 +305,19 @@ func (e *TwoByteHeaderExtension) Del(id uint8) error {
 
 			continue
 		}
+		if n+1 >= len(e.payload) { // truncated element header
+			break
+		}
 
 		extid := e.payload[n]
-
 		payloadLen := int(e.payload[n+1])
+		if n+2+payloadLen > len(e.payload) { // truncated element payload
+			break
+		}
 
 		if extid == id {
 			e.payload = append(e.payload[:n], e.payload[n+2+payloadLen:]...)
+			e.finalize()
 
 			return nil
 		}
@@ -286,6 +329,10 @@ func (e *TwoByteHeaderExtension) Del(id uint8) error {
 
 // Unmarshal parses the extension payload.
 func (e *TwoByteHeaderExtension) Unmarshal(buf []byte) (int, error) {
+	if len(buf) < 4 {
+		return 0, fmt.Errorf("size %d < %d: %w", len(buf), 4, errHeaderSizeInsufficientForExtension)
+	}
+
 	profile := binary.BigEndian.Uint16(buf[0:2])
 	if profile != ExtensionProfileTwoByte {
 		return 0, fmt.Errorf("%w actual(%x)", errHeaderExtensionNotFound, buf[0:2])

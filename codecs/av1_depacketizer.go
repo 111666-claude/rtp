@@ -13,6 +13,10 @@ import (
 // Reads AV1 packets from a RTP stream and outputs AV1 low overhead bitstream.
 type AV1Depacketizer struct {
 	// holds the fragmented OBU from the previous packet.
+	// The backing array is always owned by the depacketizer: fragments are
+	// copied into it and it is never returned to (or aliased with) callers.
+	// Spare capacity is retained across packets and frames so reassembly
+	// grows amortized instead of re-copying the whole OBU per fragment.
 	buffer []byte
 
 	// Z, Y, N are flags from the AV1 Aggregation Header.
@@ -57,12 +61,12 @@ func (d *AV1Depacketizer) Unmarshal(payload []byte) (buff []byte, err error) {
 	d.Y = obuY
 	d.N = obuN
 	if obuN {
-		d.buffer = nil
+		d.buffer = d.buffer[:0]
 	}
 
 	// Make sure we clear the buffer if Z is not 0.
 	if !obuZ && len(d.buffer) > 0 {
-		d.buffer = nil
+		d.buffer = d.buffer[:0]
 	}
 
 	obuOffset := 0
@@ -117,21 +121,35 @@ func (d *AV1Depacketizer) Unmarshal(payload []byte) (buff []byte, err error) {
 				continue
 			}
 
-			obuBuffer = make([]byte, len(d.buffer)+lengthField)
+			// d.buffer is owned by the depacketizer, so the fragment is
+			// appended in place. Amortized growth keeps long fragment
+			// sequences from degenerating into quadratic re-copying.
+			d.buffer = append(d.buffer, payload[offset:offset+lengthField]...)
 
-			copy(obuBuffer, d.buffer)
-			copy(obuBuffer[len(d.buffer):], payload[offset:offset+lengthField])
+			if isLast && obuY {
+				// The OBU continues in a later packet, keep the buffer.
+				break
+			}
+
+			// The OBU is complete: ownership of the assembled bytes moves to
+			// obuBuffer. They are copied into the output below and never
+			// retained, so detaching them here cannot alias returned slices.
+			obuBuffer = d.buffer
 			d.buffer = nil
 		} else {
 			obuBuffer = payload[offset : offset+lengthField]
+
+			if isLast && obuY {
+				// The OBU continues in a later packet. obuBuffer aliases the
+				// caller's payload, which the caller may reuse for the next
+				// packet, so the fragment must be copied into the buffer we
+				// own to survive until then.
+				d.buffer = append(d.buffer, obuBuffer...)
+
+				break
+			}
 		}
 		offset += lengthField
-
-		if isLast && obuY {
-			d.buffer = obuBuffer
-
-			break
-		}
 
 		if len(obuBuffer) == 0 {
 			continue

@@ -13,6 +13,7 @@ var (
 	errTooSmall                           = errors.New("buffer too small")
 	errHeaderExtensionsNotEnabled         = errors.New("h.Extension not enabled")
 	errHeaderExtensionNotFound            = errors.New("extension not found")
+	errHeaderExtensionEmptyPayload        = errors.New("header extension payload must not be empty")
 
 	errRFC8285OneByteHeaderIDRange = errors.New(
 		"header extension id must be between 1 and 14 for RFC 5285 one byte extensions",

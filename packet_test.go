@@ -1386,6 +1386,249 @@ func BenchmarkMarshalTo(b *testing.B) {
 	}
 }
 
+// TestExtensionOnly verifies that a control packet consisting of the RTP
+// header and a header extension only (no media payload) is parsed when the
+// extension data ends exactly at the end of the buffer.
+func TestExtensionOnly(t *testing.T) {
+	cases := map[string]struct {
+		raw      []byte
+		expected *Packet
+	}{
+		"OneByteExtension": {
+			raw: []byte{
+				0x90, 0x60, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
+				0x27, 0x82, // SSRC
+				0xBE, 0xDE, 0x00, 0x01, // one-byte profile, one 32-bit word
+				0x12, 0xAA, 0xBB, 0xCC, // ID=1, L=3, extension payload ends at buffer end
+			},
+			expected: &Packet{
+				Header: Header{
+					Version:          2,
+					Extension:        true,
+					PayloadType:      96,
+					SequenceNumber:   27023,
+					Timestamp:        3653407706,
+					SSRC:             476325762,
+					CSRC:             []uint32{},
+					ExtensionProfile: ExtensionProfileOneByte,
+					Extensions: []Extension{
+						{id: 1, payload: []byte{0xAA, 0xBB, 0xCC}},
+					},
+				},
+				Payload: []byte{},
+			},
+		},
+		"TwoByteExtension": {
+			raw: []byte{
+				0x90, 0x60, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
+				0x27, 0x82, // SSRC
+				0x10, 0x00, 0x00, 0x01, // two-byte profile, one 32-bit word
+				0x01, 0x02, 0xAA, 0xBB, // ID=1, L=2, extension payload ends at buffer end
+			},
+			expected: &Packet{
+				Header: Header{
+					Version:          2,
+					Extension:        true,
+					PayloadType:      96,
+					SequenceNumber:   27023,
+					Timestamp:        3653407706,
+					SSRC:             476325762,
+					CSRC:             []uint32{},
+					ExtensionProfile: ExtensionProfileTwoByte,
+					Extensions: []Extension{
+						{id: 1, payload: []byte{0xAA, 0xBB}},
+					},
+				},
+				Payload: []byte{},
+			},
+		},
+		"OneByteExtensionWithCSRC": {
+			raw: []byte{
+				0x92, 0x60, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
+				0x27, 0x82, // SSRC
+				0x01, 0x02, 0x03, 0x04, // CSRC 0
+				0x05, 0x06, 0x07, 0x08, // CSRC 1
+				0xBE, 0xDE, 0x00, 0x01, // one-byte profile, one 32-bit word
+				0x12, 0xAA, 0xBB, 0xCC, // ID=1, L=3, extension payload ends at buffer end
+			},
+			expected: &Packet{
+				Header: Header{
+					Version:          2,
+					Extension:        true,
+					PayloadType:      96,
+					SequenceNumber:   27023,
+					Timestamp:        3653407706,
+					SSRC:             476325762,
+					CSRC:             []uint32{0x01020304, 0x05060708},
+					ExtensionProfile: ExtensionProfileOneByte,
+					Extensions: []Extension{
+						{id: 1, payload: []byte{0xAA, 0xBB, 0xCC}},
+					},
+				},
+				Payload: []byte{},
+			},
+		},
+	}
+
+	for name, testCase := range cases {
+		testCase := testCase
+		t.Run(name, func(t *testing.T) {
+			packet := &Packet{}
+			assert.NoError(t, packet.Unmarshal(testCase.raw))
+			assert.Equal(t, testCase.expected, packet)
+			assert.Empty(t, packet.Payload, "extension-only packet must have an empty payload")
+			assert.Equal(t, len(testCase.raw), packet.MarshalSize())
+
+			// Marshal must reproduce the original bytes and survive a roundtrip.
+			raw, err := packet.Marshal()
+			assert.NoError(t, err)
+			assert.Equal(t, testCase.raw, raw)
+
+			roundtrip := &Packet{}
+			assert.NoError(t, roundtrip.Unmarshal(raw))
+			assert.Equal(t, testCase.expected, roundtrip)
+		})
+	}
+}
+
+// TestExtensionOnlyTruncated verifies that packets that are one byte short in
+// any part of the header or extension are still rejected without panicking.
+func TestExtensionOnlyTruncated(t *testing.T) {
+	cases := map[string]struct {
+		input []byte
+		err   error
+	}{
+		"MissingExtensionHeaderByte": {
+			input: []byte{
+				0x90, 0x60, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
+				0x27, 0x82, // SSRC
+				0xBE, 0xDE, 0x00, // extension profile and one length byte, second missing
+			},
+			err: errHeaderSizeInsufficientForExtension,
+		},
+		"MissingCSRCByte": {
+			input: []byte{
+				0x82, 0x60, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
+				0x27, 0x82, // SSRC, but two CSRCs are announced
+				0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, // second CSRC is one byte short
+			},
+			err: errHeaderSizeInsufficient,
+		},
+		"ExtensionLengthBeyondBuffer": {
+			input: []byte{
+				0x90, 0x60, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
+				0x27, 0x82, // SSRC
+				0xBE, 0xDE, 0x00, 0x02, // two 32-bit words announced
+				0x12, 0xAA, 0xBB, 0xCC, // only one word present
+			},
+			err: errHeaderSizeInsufficientForExtension,
+		},
+		"OneByteElementPayloadBeyondBuffer": {
+			input: []byte{
+				0x90, 0x60, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
+				0x27, 0x82, // SSRC
+				0xBE, 0xDE, 0x00, 0x01, // one 32-bit word
+				0x13, 0xAA, 0xBB, 0xCC, // ID=1, L=4, needs one more byte
+			},
+			err: errHeaderSizeInsufficientForExtension,
+		},
+		"TwoByteElementPayloadBeyondBuffer": {
+			input: []byte{
+				0x90, 0x60, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
+				0x27, 0x82, // SSRC
+				0x10, 0x00, 0x00, 0x01, // one 32-bit word
+				0x01, 0x05, 0xAA, 0xBB, // ID=1, L=5, needs three more bytes
+			},
+			err: errHeaderSizeInsufficientForExtension,
+		},
+		"TwoByteElementLengthByteMissing": {
+			input: []byte{
+				0x90, 0x60, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
+				0x27, 0x82, // SSRC
+				0x10, 0x00, 0x00, 0x01, // one 32-bit word
+				0x01, 0x01, 0xAA, 0xBB, // second element has only its ID byte, no length
+			},
+			err: errHeaderSizeInsufficientForExtension,
+		},
+	}
+
+	for name, testCase := range cases {
+		testCase := testCase
+		t.Run(name, func(t *testing.T) {
+			assert.NotPanics(t, func() {
+				header := &Header{}
+				_, err := header.Unmarshal(testCase.input)
+				assert.ErrorIs(t, err, testCase.err)
+
+				packet := &Packet{}
+				assert.ErrorIs(t, packet.Unmarshal(testCase.input), testCase.err)
+			})
+		})
+	}
+}
+
+// TestExtensionOnlyEdgeInputs covers degenerate extension-only inputs: an empty
+// buffer, a zero extension length and a packet that only contains the extension
+// header. All of them must yield a stable result without panicking.
+func TestExtensionOnlyEdgeInputs(t *testing.T) {
+	t.Run("EmptyInput", func(t *testing.T) {
+		assert.NotPanics(t, func() {
+			header := &Header{}
+			n, err := header.Unmarshal([]byte{})
+			assert.ErrorIs(t, err, errHeaderSizeInsufficient)
+			assert.Equal(t, 0, n)
+		})
+	})
+
+	t.Run("HeaderWithExtensionBitOnly", func(t *testing.T) {
+		assert.NotPanics(t, func() {
+			header := &Header{}
+			_, err := header.Unmarshal([]byte{
+				0x90, 0x60, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
+				0x27, 0x82, // SSRC, extension announced but not present
+			})
+			assert.ErrorIs(t, err, errHeaderSizeInsufficientForExtension)
+		})
+	})
+
+	t.Run("ZeroExtensionLengthOneByteProfile", func(t *testing.T) {
+		rawPkt := []byte{
+			0x90, 0x60, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
+			0x27, 0x82, // SSRC
+			0xBE, 0xDE, 0x00, 0x00, // extension header only, zero length
+		}
+
+		assert.NotPanics(t, func() {
+			packet := &Packet{}
+			assert.NoError(t, packet.Unmarshal(rawPkt))
+			assert.Empty(t, packet.Extensions)
+			assert.Empty(t, packet.Payload)
+
+			raw, err := packet.Marshal()
+			assert.NoError(t, err)
+			assert.Equal(t, rawPkt, raw)
+		})
+	})
+
+	t.Run("ZeroExtensionLengthRFC3550Profile", func(t *testing.T) {
+		rawPkt := []byte{
+			0x90, 0x60, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
+			0x27, 0x82, // SSRC
+			0x11, 0x11, 0x00, 0x00, // extension header only, zero length
+		}
+
+		assert.NotPanics(t, func() {
+			packet := &Packet{}
+			assert.NoError(t, packet.Unmarshal(rawPkt))
+			assert.Empty(t, packet.Payload)
+
+			raw, err := packet.Marshal()
+			assert.NoError(t, err)
+			assert.Equal(t, rawPkt, raw)
+		})
+	})
+}
+
 func BenchmarkUnmarshal(b *testing.B) {
 	pkt := Packet{
 		Header: Header{

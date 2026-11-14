@@ -206,7 +206,10 @@ func (h *Header) Unmarshal(buf []byte) (n int, err error) { //nolint:gocognit,cy
 					n++
 				}
 
-				if extensionPayloadEnd := n + payloadLen; len(buf) <= extensionPayloadEnd {
+				// The extension payload may end exactly at the end of the buffer:
+				// a control packet can consist of the header and extension only,
+				// without any media payload following it.
+				if extensionPayloadEnd := n + payloadLen; len(buf) < extensionPayloadEnd {
 					return n, fmt.Errorf("size %d < %d: %w", len(buf), extensionPayloadEnd, errHeaderSizeInsufficientForExtension)
 				}
 

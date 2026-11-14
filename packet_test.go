@@ -1449,3 +1449,274 @@ func TestMarshalToPanic(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 16, n)
 }
+
+func TestUnmarshalExtensionOnlyPacket(t *testing.T) { // nolint:maintidx
+	// A control packet may consist of an RTP header and a header extension only,
+	// with no media payload. The extension data ends exactly at the end of the
+	// buffer; parsing must succeed and the payload must be empty.
+	cases := map[string]struct {
+		rawPkt           []byte
+		profile          uint16
+		expectedIDs      []uint8
+		expectedPayloads map[uint8][]byte
+	}{
+		// One byte extension, element with 3 byte payload, no trailing padding:
+		// 12 byte header + 4 byte extension header + 1 byte element header + 3 byte data = 20 bytes.
+		"OneByteNoPadding": {
+			rawPkt: []byte{
+				0x90, 0xe0, 0x69, 0x8f,
+				0xd9, 0xc2, 0x93, 0xda, // timestamp
+				0x1c, 0x64, 0x27, 0x82, // SSRC
+				0xBE, 0xDE, 0x00, 0x01, // profile 0xBEDE, extension length 1
+				0x12, 0xAA, 0xBB, 0xCC, // id 1, length 3, data
+			},
+			profile:          0xBEDE,
+			expectedIDs:      []uint8{1},
+			expectedPayloads: map[uint8][]byte{1: {0xAA, 0xBB, 0xCC}},
+		},
+		// One byte extension, element with 1 byte payload followed by extension block padding.
+		"OneByteWithPadding": {
+			rawPkt: []byte{
+				0x90, 0xe0, 0x69, 0x8f,
+				0xd9, 0xc2, 0x93, 0xda, // timestamp
+				0x1c, 0x64, 0x27, 0x82, // SSRC
+				0xBE, 0xDE, 0x00, 0x01, // profile 0xBEDE, extension length 1
+				0x50, 0xAA, 0x00, 0x00, // id 5, length 1, data, padding
+			},
+			profile:          0xBEDE,
+			expectedIDs:      []uint8{5},
+			expectedPayloads: map[uint8][]byte{5: {0xAA}},
+		},
+		// Two byte extension, element with 2 byte payload, no trailing padding:
+		// 12 byte header + 4 byte extension header + 2 byte element header + 2 byte data = 20 bytes.
+		"TwoByteNoPadding": {
+			rawPkt: []byte{
+				0x90, 0xe0, 0x69, 0x8f,
+				0xd9, 0xc2, 0x93, 0xda, // timestamp
+				0x1c, 0x64, 0x27, 0x82, // SSRC
+				0x10, 0x00, 0x00, 0x01, // profile 0x1000, extension length 1
+				0x01, 0x02, 0xAA, 0xBB, // id 1, length 2, data
+			},
+			profile:          0x1000,
+			expectedIDs:      []uint8{1},
+			expectedPayloads: map[uint8][]byte{1: {0xAA, 0xBB}},
+		},
+	}
+
+	for name, testCase := range cases {
+		testCase := testCase
+		t.Run(name, func(t *testing.T) {
+			packet := &Packet{}
+			assert.NoError(t, packet.Unmarshal(testCase.rawPkt), "Unmarshal of extension only packet failed")
+			assert.Empty(t, packet.Payload, "Unmarshal of extension only packet must have empty payload")
+			assert.Equal(t, testCase.profile, packet.Header.ExtensionProfile)
+			assert.ElementsMatch(t, testCase.expectedIDs, packet.GetExtensionIDs())
+
+			for id, expected := range testCase.expectedPayloads {
+				assert.Equal(t, expected, packet.GetExtension(id), "extension %d has wrong data", id)
+			}
+
+			// A successful parse must survive a Marshal/Unmarshal round trip.
+			marshaled, err := packet.Marshal()
+			assert.NoError(t, err)
+			assert.Equal(t, testCase.rawPkt, marshaled)
+
+			roundTripped := &Packet{}
+			assert.NoError(t, roundTripped.Unmarshal(marshaled))
+			assert.Empty(t, roundTripped.Payload)
+			assert.Equal(t, packet.Header, roundTripped.Header)
+		})
+	}
+}
+
+func TestUnmarshalExtensionOnlyHeaderRoundTrip(t *testing.T) {
+	// Parse a header in isolation (no payload at all) then re-marshal it.
+	rawHdr := []byte{
+		0x90, 0xe0, 0x69, 0x8f,
+		0xd9, 0xc2, 0x93, 0xda, // timestamp
+		0x1c, 0x64, 0x27, 0x82, // SSRC
+		0xBE, 0xDE, 0x00, 0x01, // profile 0xBEDE, extension length 1
+		0x12, 0xAA, 0xBB, 0xCC, // id 1, length 3, data
+	}
+
+	header := &Header{}
+	n, err := header.Unmarshal(rawHdr)
+	assert.NoError(t, err)
+	assert.Equal(t, len(rawHdr), n)
+
+	assert.Equal(t, uint16(0xBEDE), header.ExtensionProfile)
+	assert.Len(t, header.Extensions, 1)
+	assert.Equal(t, uint8(1), header.Extensions[0].id)
+	assert.Equal(t, []byte{0xAA, 0xBB, 0xCC}, header.Extensions[0].payload)
+
+	marshaled, err := header.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, rawHdr, marshaled)
+
+	parsed := &Header{}
+	_, err = parsed.Unmarshal(marshaled)
+	assert.NoError(t, err)
+	assert.Equal(t, header, parsed)
+}
+
+func TestUnmarshalExtensionTruncated(t *testing.T) {
+	// Every truncated variant must fail with the pre-existing short packet errors
+	// and must never index out of bounds.
+	hdr := []byte{
+		0x90, 0xe0, 0x69, 0x8f,
+		0xd9, 0xc2, 0x93, 0xda, // timestamp
+		0x1c, 0x64, 0x27, 0x82, // SSRC
+	}
+
+	cases := map[string]struct {
+		input []byte
+		err   error
+	}{
+		"OneByteElementDataShortByOne": {
+			input: append(hdr,
+				0xBE, 0xDE, 0x00, 0x01, // profile 0xBEDE, extension length 1
+				0x12, 0xAA, 0xBB, // id 1 declares 3 bytes, only 2 present
+			),
+			err: errHeaderSizeInsufficientForExtension,
+		},
+		"OneByteElementHeaderOnly": {
+			input: append(hdr,
+				0xBE, 0xDE, 0x00, 0x01, // profile 0xBEDE, extension length 1
+				0x12, // id 1 declares 3 bytes, none present
+			),
+			err: errHeaderSizeInsufficientForExtension,
+		},
+		"TwoByteElementLengthMissing": {
+			input: append(hdr,
+				0x10, 0x00, 0x00, 0x01, // profile 0x1000, extension length 1
+				0x01, // id present, length byte missing
+			),
+			err: errHeaderSizeInsufficientForExtension,
+		},
+		"TwoByteElementDataShortByOne": {
+			input: append(hdr,
+				0x10, 0x00, 0x00, 0x01, // profile 0x1000, extension length 1
+				0x01, 0x02, 0xAA, // id 1 declares 2 bytes, only 1 present
+			),
+			err: errHeaderSizeInsufficientForExtension,
+		},
+		"ExtensionHeaderShortByOne": {
+			input: append(hdr,
+				0xBE, 0xDE, 0x00, // extension header truncated by one byte
+			),
+			err: errHeaderSizeInsufficientForExtension,
+			// expected n is the header size, nothing more.
+		},
+		"ExtensionLengthShortByOne": {
+			input: append(hdr,
+				0xBE, 0xDE, 0x00, 0x02, // declares 2 words of extension data
+				0x12, 0xAA, 0xBB, 0xCC, // only 1 word present
+			),
+			err: errHeaderSizeInsufficientForExtension,
+		},
+		"CSRCShortByOne": {
+			input: []byte{
+				0x91, 0xe0, 0x69, 0x8f, // CC=1
+				0xd9, 0xc2, 0x93, 0xda, // timestamp
+				0x1c, 0x64, 0x27, 0x82, // SSRC
+				0x01, 0x02, 0x03, // only 3 of 4 CSRC bytes
+			},
+			err: errHeaderSizeInsufficient,
+		},
+	}
+
+	for name, testCase := range cases {
+		testCase := testCase
+		t.Run(name, func(t *testing.T) {
+			header := &Header{}
+			_, err := header.Unmarshal(testCase.input)
+			assert.ErrorIs(t, err, testCase.err)
+		})
+	}
+}
+
+func TestUnmarshalExtensionEdgeCases(t *testing.T) {
+	cases := map[string]struct {
+		input  []byte
+		err    error
+		extLen int
+	}{
+		"Empty": {
+			input: []byte{},
+			err:   errHeaderSizeInsufficient,
+		},
+		"ExtensionHeaderOnly": {
+			input: []byte{
+				0x90, 0xe0, 0x69, 0x8f,
+				0xd9, 0xc2, 0x93, 0xda, // timestamp
+				0x1c, 0x64, 0x27, 0x82, // SSRC
+			},
+			err: errHeaderSizeInsufficientForExtension,
+		},
+		"ZeroExtensionLength": {
+			input: []byte{
+				0x90, 0xe0, 0x69, 0x8f,
+				0xd9, 0xc2, 0x93, 0xda, // timestamp
+				0x1c, 0x64, 0x27, 0x82, // SSRC
+				0xBE, 0xDE, 0x00, 0x00, // profile 0xBEDE, zero length extension
+			},
+			err:    nil,
+			extLen: 0,
+		},
+		"ZeroExtensionLengthRFC3550Profile": {
+			input: []byte{
+				0x90, 0xe0, 0x69, 0x8f,
+				0xd9, 0xc2, 0x93, 0xda, // timestamp
+				0x1c, 0x64, 0x27, 0x82, // SSRC
+				0x11, 0x22, 0x00, 0x00, // RFC3550 profile, zero length extension
+			},
+			err: nil,
+			// The RFC3550 branch always records a single raw extension, even when empty.
+			extLen: 1,
+		},
+	}
+
+	for name, testCase := range cases {
+		testCase := testCase
+		t.Run(name, func(t *testing.T) {
+			header := &Header{}
+			assert.NotPanics(t, func() {
+				_, err := header.Unmarshal(testCase.input)
+				if testCase.err == nil {
+					assert.NoError(t, err)
+					assert.Len(t, header.Extensions, testCase.extLen)
+				} else {
+					assert.ErrorIs(t, err, testCase.err)
+				}
+			})
+		})
+	}
+}
+
+func TestUnmarshalExtensionWithCSRCAndPayload(t *testing.T) {
+	// Existing behaviour for packets with multiple CSRCs, a two byte profile
+	// extension and a media payload must be preserved.
+	rawPkt := []byte{
+		0x92, 0xe0, 0x69, 0x8f,
+		0xd9, 0xc2, 0x93, 0xda, // timestamp
+		0x1c, 0x64, 0x27, 0x82, // SSRC
+		0x00, 0x00, 0x00, 0x01, // CSRC 1
+		0x00, 0x00, 0x00, 0x02, // CSRC 2
+		0x10, 0x00, 0x00, 0x02, // profile 0x1000, extension length 2
+		0x01, 0x02, 0xAA, 0xBB, // id 1, length 2, data
+		0x02, 0x00, 0x00, 0x00, // id 2, length 0, padding
+		0x98, 0x36, 0xbe, 0x88, 0x9e, // media payload
+	}
+
+	packet := &Packet{}
+	assert.NoError(t, packet.Unmarshal(rawPkt))
+	assert.Equal(t, []uint32{1, 2}, packet.Header.CSRC)
+	assert.Equal(t, uint16(0x1000), packet.Header.ExtensionProfile)
+	assert.Equal(t, []byte{0xAA, 0xBB}, packet.GetExtension(1))
+	assert.Equal(t, []byte{}, packet.GetExtension(2))
+	assert.Equal(t, rawPkt[32:], packet.Payload)
+
+	marshaled, err := packet.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, rawPkt, marshaled)
+}

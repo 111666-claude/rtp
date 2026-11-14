@@ -16,7 +16,6 @@ type Spreader struct {
 	Spreading    bool
 	RTPOffset    uint16
 	fuInProgress *fuInProgress
-	trailingBuf  []byte
 }
 
 type fuInProgress struct {
@@ -24,6 +23,10 @@ type fuInProgress struct {
 	RTPHeader    []byte
 	Trailing     []byte
 	FuStartBytes [2]byte
+	// Marker accumulates the RTP marker bits of every FU-A that belongs to this
+	// fragmentation. A FU-A that produces no output packet would otherwise drop
+	// its marker, so it is deferred and applied when a packet is finally emitted.
+	Marker bool
 }
 
 const (
@@ -148,7 +151,6 @@ func NewSpreader(mtu uint16) Spreader {
 		Spreading:    false,
 		RTPOffset:    0,
 		fuInProgress: nil,
-		trailingBuf:  make([]byte, mtu),
 	}
 }
 
@@ -230,7 +232,7 @@ func (s *Spreader) handleNalTooBigOrFua(cumulRTP [][]byte, seqNum uint16, naluTy
 }
 
 // relying on continuous seq number & start/end FU bits to sync ourselve, so not looking at RtpTimestamp.
-func (s *Spreader) spreadFua(cumulRTP [][]byte, firtSeqNum uint16, rtpHeader []byte, fua []byte) ([][]byte, uint16, error) { //nolint:lll
+func (s *Spreader) spreadFua(cumulRTP [][]byte, firtSeqNum uint16, rtpHeader []byte, fua []byte) ([][]byte, uint16, error) { //nolint:cyclop,lll
 	seqNum := firtSeqNum
 	if s.fuInProgress != nil {
 		expectedSeq := s.fuInProgress.LastSeq + 1
@@ -241,10 +243,18 @@ func (s *Spreader) spreadFua(cumulRTP [][]byte, firtSeqNum uint16, rtpHeader []b
 		}
 	}
 
-	entryMarker := rtpHeader[rtpMPtOffset] & rtpMarkerBitMask
+	entryMarker := (rtpHeader[rtpMPtOffset] & rtpMarkerBitMask) != 0
 	rtpHeader[rtpMPtOffset] &= ^rtpMarkerBitMask
 
 	lenRTPHeader := len(rtpHeader)
+	reqSubSize := s.Mtu - lenRTPHeader - fuaOverhead
+	if reqSubSize <= 0 {
+		return nil, seqNum, fmt.Errorf(
+			"MTU %d is too small to carry an RTP header (%d bytes) and a FU-A (%d bytes)",
+			s.Mtu, lenRTPHeader, fuaOverhead,
+		) //nolint:err113
+	}
+
 	if s.fuInProgress == nil {
 		rtpHeaderCpy := make([]byte, lenRTPHeader)
 		copy(rtpHeaderCpy, rtpHeader)
@@ -256,48 +266,77 @@ func (s *Spreader) spreadFua(cumulRTP [][]byte, firtSeqNum uint16, rtpHeader []b
 		s.fuInProgress.FuStartBytes[fuaIndicatorOffset] = fua[fuaIndicatorOffset]
 		s.fuInProgress.FuStartBytes[fuaHeaderOffest] = fua[fuaHeaderOffest] & (^fuEndBitmask)
 	}
+	// A marker seen on any FU-A of this fragmentation is kept until a packet is
+	// emitted, so FU-A calls that only feed the cache cannot lose the marker.
+	s.fuInProgress.Marker = s.fuInProgress.Marker || entryMarker
+
+	mustFinish := (fua[fuaHeaderOffest] & fuEndBitmask) != 0
+	newData := fua[fuaOverhead:]
+
+	// Merge the previously cached (too-small) fragment with the new payload. The
+	// cache always holds fewer than reqSubSize bytes, so the merged buffer either
+	// produces a packet now or stays cached; each input byte is copied a constant
+	// number of times, keeping the whole processing linear.
+	if len(newData) > 0 {
+		s.fuInProgress.Trailing = append(s.fuInProgress.Trailing, newData...)
+	}
+	data := s.fuInProgress.Trailing
 
 	var lastFuHeader *byte
-	mustFinish := (fua[fuaHeaderOffest] & fuEndBitmask) != 0
-	reqSubSize := s.Mtu - lenRTPHeader - fuaOverhead
-	newData := fua[fuaOverhead:]
-	currentDataSize := len(s.fuInProgress.Trailing) + len(newData)
-	for currentDataSize > reqSubSize || (mustFinish && currentDataSize > 0) {
-		bufSize := min(s.Mtu, lenRTPHeader+fuaOverhead+currentDataSize)
+	for len(data) > reqSubSize || (mustFinish && len(data) > 0) {
+		bufSize := min(s.Mtu, lenRTPHeader+fuaOverhead+len(data))
 		rtp := make([]byte, bufSize)
 		binary.BigEndian.PutUint16(rtpHeader[rtpSeqNumOffset:rtpSeqNumOffset+rtpSeqNumLength], seqNum)
 		copy(rtp, rtpHeader)
 		copy(rtp[lenRTPHeader:], s.fuInProgress.FuStartBytes[:])
 		lastFuHeader = &rtp[lenRTPHeader+1]
 
-		lenTrailing := len(s.fuInProgress.Trailing)
-		if lenTrailing > 0 {
-			copy(rtp[lenRTPHeader+fuaOverhead:], s.fuInProgress.Trailing)
-			s.fuInProgress.Trailing = nil
-		}
-		toCopyFromNew := min(reqSubSize-lenTrailing, len(newData))
-		if toCopyFromNew > 0 {
-			copy(rtp[lenRTPHeader+fuaOverhead+lenTrailing:], newData[:toCopyFromNew])
-			newData = newData[toCopyFromNew:]
-		}
+		toCopy := min(reqSubSize, len(data))
+		copy(rtp[lenRTPHeader+fuaOverhead:], data[:toCopy])
+		data = data[toCopy:]
 
 		cumulRTP = append(cumulRTP, rtp)
 
 		s.fuInProgress.FuStartBytes[fuaHeaderOffest] &= ^fuStartBitmask
 		s.fuInProgress.LastSeq = seqNum
 		seqNum += 1
-		currentDataSize = len(newData)
 	}
 
 	if mustFinish {
+		// Only this FU-A's own emissions carry its End bit. A gap-flush can append
+		// earlier packets to cumulRTP before a recursive call, so the cumulative
+		// length alone does not prove this FU produced a packet.
+		if lastFuHeader == nil {
+			// End bit with no media data and nothing cached: there is no legal FU
+			// payload to emit. Surface it as an error instead of a nil dereference
+			// or silently dropping the end of the NAL unit.
+			s.fuInProgress = nil
+
+			return nil, seqNum, fmt.Errorf("FU-A end bit set without any media data") //nolint:err113
+		}
+		// The last emitted packet carries the End bit (and, if any input FU-A had
+		// its marker set, the RTP marker).
 		*lastFuHeader |= fuEndBitmask
+		if s.fuInProgress.Marker {
+			cumulRTP[len(cumulRTP)-1][rtpMPtOffset] |= rtpMarkerBitMask
+		}
 		s.fuInProgress = nil
-	} else {
-		copy(s.trailingBuf, newData)
-		s.fuInProgress.Trailing = s.trailingBuf[:len(newData)]
+
+		return cumulRTP, seqNum, nil
 	}
 
-	cumulRTP[len(cumulRTP)-1][rtpMPtOffset] |= entryMarker
+	// Keep the unemitted remainder in a cache that this Spreader owns. The input
+	// FU-A buffers may be reused by the caller between calls, so the remainder must
+	// be copied out rather than aliased; the total copied volume stays linear.
+	trailing := make([]byte, len(data))
+	copy(trailing, data)
+	s.fuInProgress.Trailing = trailing
+
+	if len(cumulRTP) > 0 {
+		if s.fuInProgress.Marker {
+			cumulRTP[len(cumulRTP)-1][rtpMPtOffset] |= rtpMarkerBitMask
+		}
+	}
 
 	return cumulRTP, seqNum, nil
 }
@@ -334,6 +373,12 @@ func (s *Spreader) spreadSingleNalToFua(cumulRTP [][]byte, firtSeqNum uint16, rt
 	fuIndicator := (nal[nalUnitTypeOffset] ^ naluTypeBitmask) | fuaNALUType
 	lenRTPHeader := len(rtpHeader)
 	reqSubSize := s.Mtu - lenRTPHeader - fuaOverhead
+	if reqSubSize <= 0 {
+		return nil, firtSeqNum, fmt.Errorf(
+			"MTU %d is too small to carry an RTP header (%d bytes) and a FU-A (%d bytes)",
+			s.Mtu, lenRTPHeader, fuaOverhead,
+		) //nolint:err113
+	}
 
 	// rfc6184:
 	// The NAL unit type octet of the fragmented NAL unit is not included as such in the fragmentation unit payload,
@@ -379,14 +424,29 @@ func (s *Spreader) explodeStapA(
 	rtpHeader[rtpMPtOffset] &= ^rtpMarkerBitMask
 	lenRTPHeader := len(rtpHeader)
 	maxSize := s.Mtu - lenRTPHeader
+	if maxSize <= 0 {
+		return nil, firtSeqNum, fmt.Errorf(
+			"MTU %d is too small to carry an RTP header (%d bytes)",
+			s.Mtu, lenRTPHeader,
+		) //nolint:err113
+	}
 	currOffset := int(stapaHeaderSize)
 	lenStapA := len(stapa)
 	seqNum := firtSeqNum
 	var err error
 	for currOffset < lenStapA {
+		if lenStapA-currOffset < stapaNALULengthSize {
+			return nil, seqNum, fmt.Errorf(
+				"STAP-A is truncated: %d byte(s) left but NAL unit length needs %d bytes",
+				lenStapA-currOffset, stapaNALULengthSize,
+			) //nolint:err113
+		}
 		naluSize := int(binary.BigEndian.Uint16(stapa[currOffset:]))
 		currOffset += stapaNALULengthSize
 
+		if naluSize == 0 {
+			return nil, seqNum, fmt.Errorf("STAP-A contains an empty NAL unit") //nolint:err113
+		}
 		if lenStapA < currOffset+naluSize {
 			return nil, seqNum, fmt.Errorf("STAP-A declared size(%d) is larger than buffer(%d)", naluSize, lenStapA-currOffset) //nolint:err113
 		}
@@ -408,12 +468,18 @@ func (s *Spreader) explodeStapA(
 		}
 	}
 
+	if len(cumulRTP) == 0 {
+		return nil, seqNum, fmt.Errorf("STAP-A contains no NAL unit") //nolint:err113
+	}
 	cumulRTP[len(cumulRTP)-1][rtpMPtOffset] |= entryMarker
 
 	return cumulRTP, seqNum, nil
 }
 
 func sliceTo(reqSize int, data []byte) [][]byte {
+	if reqSize <= 0 || len(data) == 0 {
+		return nil
+	}
 	chunkNb := (len(data) + reqSize - 1) / reqSize
 	chunks := make([][]byte, chunkNb)
 	for i := 0; i < (chunkNb - 1); i++ {

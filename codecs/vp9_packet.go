@@ -399,6 +399,9 @@ func (p *VP9Packet) parseLayerInfoNonFlexibleMode(packet []byte, pos int) (int, 
 **/
 // .
 func (p *VP9Packet) parseRefIndices(packet []byte, pos int) (int, error) {
+	// Drop reference indices of a previous packet, retaining capacity for reuse.
+	p.PDiff = p.PDiff[:0]
+
 	for {
 		if len(packet) <= pos {
 			return pos, errShortPacket
@@ -452,8 +455,18 @@ func (p *VP9Packet) parseSSData(packet []byte, pos int) (int, error) { // nolint
 	p.NG = 0
 
 	if p.Y {
-		p.Width = make([]uint16, NS)
-		p.Height = make([]uint16, NS)
+		// Reuse the slices of a previously parsed packet when they are large
+		// enough, so a reused VP9Packet doesn't allocate on every packet.
+		if cap(p.Width) < int(NS) {
+			p.Width = make([]uint16, NS)
+		} else {
+			p.Width = p.Width[:NS]
+		}
+		if cap(p.Height) < int(NS) {
+			p.Height = make([]uint16, NS)
+		} else {
+			p.Height = p.Height[:NS]
+		}
 		for i := 0; i < int(NS); i++ {
 			if len(packet) <= (pos + 3) {
 				return pos, errShortPacket
@@ -464,6 +477,11 @@ func (p *VP9Packet) parseSSData(packet []byte, pos int) (int, error) { // nolint
 			p.Height[i] = uint16(packet[pos])<<8 | uint16(packet[pos+1])
 			pos += 2
 		}
+	} else {
+		// No resolutions in this packet: truncate so stale layers of a
+		// previously parsed packet are not observable.
+		p.Width = p.Width[:0]
+		p.Height = p.Height[:0]
 	}
 
 	if p.G {
@@ -475,6 +493,16 @@ func (p *VP9Packet) parseSSData(packet []byte, pos int) (int, error) { // nolint
 		pos++
 	}
 
+	// Reset prediction group state of a previous packet, retaining capacity
+	// (including the per-group PDiff buffers) for reuse.
+	p.PGTID = p.PGTID[:0]
+	p.PGU = p.PGU[:0]
+	pgPDiff := p.PGPDiff[:cap(p.PGPDiff)]
+	for i := range pgPDiff {
+		pgPDiff[i] = pgPDiff[i][:0]
+	}
+	p.PGPDiff = p.PGPDiff[:0]
+
 	for i := 0; i < int(p.NG); i++ {
 		if len(packet) <= pos {
 			return pos, errShortPacket
@@ -485,16 +513,23 @@ func (p *VP9Packet) parseSSData(packet []byte, pos int) (int, error) { // nolint
 		R := (packet[pos] >> 2) & 0x3
 		pos++
 
-		p.PGPDiff = append(p.PGPDiff, []uint8{})
+		var diffs []uint8
+		if i < len(pgPDiff) {
+			diffs = pgPDiff[i]
+		} else {
+			diffs = []uint8{}
+		}
 
 		if len(packet) <= (pos + int(R) - 1) {
 			return pos, errShortPacket
 		}
 
 		for j := 0; j < int(R); j++ {
-			p.PGPDiff[i] = append(p.PGPDiff[i], packet[pos])
+			diffs = append(diffs, packet[pos])
 			pos++
 		}
+
+		p.PGPDiff = append(p.PGPDiff, diffs)
 	}
 
 	return pos, nil

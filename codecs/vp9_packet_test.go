@@ -412,3 +412,182 @@ func TestVP9IsPartitionHead(t *testing.T) {
 		)
 	})
 }
+
+// Three spatial layers with resolutions and a prediction group of two pictures.
+var vp9SSDataThreeLayers = []byte{
+	0x0A,                           // B=1, V=1
+	(2 << 5) | (1 << 4) | (1 << 3), // NS:2 Y:1 G:1
+	0x02, 0x80, 0x01, 0x68,         // 640x360
+	0x05, 0x00, 0x02, 0xD0, // 1280x720
+	0x07, 0x80, 0x05, 0xA0, // 1920x1440
+	2,                              // N_G=2
+	(0 << 5) | (1 << 4) | (1 << 2), // T:0 U:1 R:1
+	10,                             // P_DIFF
+	(2 << 5) | (0 << 4) | (2 << 2), // T:2 U:0 R:2
+	20, 30,                         // P_DIFF
+	0xAA, // payload
+}
+
+// Two spatial layers with resolutions and a prediction group of one picture.
+var vp9SSDataTwoLayers = []byte{
+	0x0A,                           // B=1, V=1
+	(1 << 5) | (1 << 4) | (1 << 3), // NS:1 Y:1 G:1
+	0x02, 0x80, 0x01, 0x68,         // 640x360
+	0x05, 0x00, 0x02, 0xD0, // 1280x720
+	1,                              // N_G=1
+	(1 << 5) | (0 << 4) | (1 << 2), // T:1 U:0 R:1
+	5,                              // P_DIFF
+	0xBB,                           // payload
+}
+
+func TestVP9Packet_UnmarshalReuse(t *testing.T) {
+	unmarshalFresh := func(raw []byte) VP9Packet {
+		t.Helper()
+		pkt := VP9Packet{}
+		_, err := pkt.Unmarshal(raw)
+		assert.NoError(t, err)
+
+		return pkt
+	}
+
+	// resetLengthsKeepCapacity simulates a caller that retains the slices of a
+	// reused VP9Packet but zeroes their lengths before parsing the next packet.
+	resetLengthsKeepCapacity := func(pkt *VP9Packet) {
+		pkt.Width = pkt.Width[:0]
+		pkt.Height = pkt.Height[:0]
+		pkt.PGTID = pkt.PGTID[:0]
+		pkt.PGU = pkt.PGU[:0]
+		pkt.PGPDiff = pkt.PGPDiff[:0]
+	}
+
+	// assertSamePacket asserts that a reused packet holds the same values as a
+	// freshly parsed one. Empty slices are normalized to nil: a reused packet
+	// retains capacity, so its empty slices are non-nil unlike a fresh one's.
+	assertSamePacket := func(expected, actual VP9Packet) {
+		t.Helper()
+		normalize := func(pkt *VP9Packet) {
+			if len(pkt.Width) == 0 {
+				pkt.Width = nil
+			}
+			if len(pkt.Height) == 0 {
+				pkt.Height = nil
+			}
+			if len(pkt.PGTID) == 0 {
+				pkt.PGTID = nil
+			}
+			if len(pkt.PGU) == 0 {
+				pkt.PGU = nil
+			}
+			if len(pkt.PGPDiff) == 0 {
+				pkt.PGPDiff = nil
+			}
+		}
+		normalize(&expected)
+		normalize(&actual)
+		assert.Equal(t, expected, actual)
+	}
+
+	t.Run("ShrinkLayersAndPredictionGroup", func(t *testing.T) {
+		reused := unmarshalFresh(vp9SSDataThreeLayers)
+		assert.Equal(t, []uint16{640, 1280, 1920}, reused.Width)
+		assert.Equal(t, []uint16{360, 720, 1440}, reused.Height)
+		assert.Equal(t, []uint8{0, 2}, reused.PGTID)
+		assert.Equal(t, []bool{true, false}, reused.PGU)
+		assert.Equal(t, [][]uint8{{10}, {20, 30}}, reused.PGPDiff)
+
+		resetLengthsKeepCapacity(&reused)
+
+		_, err := reused.Unmarshal(vp9SSDataTwoLayers)
+		assert.NoError(t, err)
+
+		// The reused object must be indistinguishable from a freshly parsed one:
+		// no stale layers or prediction group entries may leak into the new packet.
+		assertSamePacket(unmarshalFresh(vp9SSDataTwoLayers), reused)
+		assert.Equal(t, []uint16{640, 1280}, reused.Width)
+		assert.Equal(t, []uint16{360, 720}, reused.Height)
+		assert.Equal(t, []uint8{1}, reused.PGTID)
+		assert.Equal(t, []bool{false}, reused.PGU)
+		assert.Equal(t, [][]uint8{{5}}, reused.PGPDiff)
+	})
+
+	t.Run("PredictionGroupMissing", func(t *testing.T) {
+		reused := unmarshalFresh(vp9SSDataThreeLayers)
+		resetLengthsKeepCapacity(&reused)
+
+		// Y:1 G:0, two layers, no prediction group.
+		raw := []byte{
+			0x0A,
+			(1 << 5) | (1 << 4),
+			0x02, 0x80, 0x01, 0x68,
+			0x05, 0x00, 0x02, 0xD0,
+			0xCC,
+		}
+		_, err := reused.Unmarshal(raw)
+		assert.NoError(t, err)
+
+		assertSamePacket(unmarshalFresh(raw), reused)
+		assert.Empty(t, reused.PGTID)
+		assert.Empty(t, reused.PGU)
+		assert.Empty(t, reused.PGPDiff)
+	})
+
+	t.Run("ResolutionsMissing", func(t *testing.T) {
+		reused := unmarshalFresh(vp9SSDataThreeLayers)
+		resetLengthsKeepCapacity(&reused)
+
+		// Y:0 G:0, no resolutions and no prediction group.
+		raw := []byte{0x0A, (1 << 5), 0xDD}
+		_, err := reused.Unmarshal(raw)
+		assert.NoError(t, err)
+
+		assertSamePacket(unmarshalFresh(raw), reused)
+		assert.Empty(t, reused.Width)
+		assert.Empty(t, reused.Height)
+	})
+
+	t.Run("GrowAfterShrink", func(t *testing.T) {
+		reused := unmarshalFresh(vp9SSDataTwoLayers)
+		resetLengthsKeepCapacity(&reused)
+
+		// Growing past the retained capacity must still parse correctly.
+		_, err := reused.Unmarshal(vp9SSDataThreeLayers)
+		assert.NoError(t, err)
+		assertSamePacket(unmarshalFresh(vp9SSDataThreeLayers), reused)
+	})
+
+	t.Run("ShortPacketAfterReuse", func(t *testing.T) {
+		reused := unmarshalFresh(vp9SSDataThreeLayers)
+		resetLengthsKeepCapacity(&reused)
+
+		// Truncated resolution.
+		_, err := reused.Unmarshal([]byte{0x0A, (0 << 5) | (1 << 4), 0x02})
+		assert.ErrorIs(t, err, errShortPacket)
+
+		// Truncated prediction group reference indices.
+		_, err = reused.Unmarshal([]byte{
+			0x0A,
+			(0 << 5) | (0 << 4) | (1 << 3),
+			1,
+			(0 << 5) | (0 << 4) | (2 << 2), // R:2 but no P_DIFF bytes follow
+		})
+		assert.ErrorIs(t, err, errShortPacket)
+	})
+}
+
+func TestVP9Packet_UnmarshalReuseNoAlloc(t *testing.T) {
+	pkt := VP9Packet{}
+	_, err := pkt.Unmarshal(vp9SSDataThreeLayers)
+	assert.NoError(t, err)
+
+	// Parsing a same-shaped packet into a reused VP9Packet must not allocate.
+	allocs := testing.AllocsPerRun(1000, func() {
+		_, _ = pkt.Unmarshal(vp9SSDataThreeLayers)
+	})
+	assert.Zero(t, allocs, "reused VP9Packet should not allocate when parsing a same-shaped packet")
+
+	assert.Equal(t, []uint16{640, 1280, 1920}, pkt.Width)
+	assert.Equal(t, []uint16{360, 720, 1440}, pkt.Height)
+	assert.Equal(t, []uint8{0, 2}, pkt.PGTID)
+	assert.Equal(t, []bool{true, false}, pkt.PGU)
+	assert.Equal(t, [][]uint8{{10}, {20, 30}}, pkt.PGPDiff)
+}

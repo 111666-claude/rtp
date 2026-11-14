@@ -230,27 +230,51 @@ func (h *Header) Unmarshal(buf []byte) (n int, err error) { //nolint:gocognit,cy
 func (p *Packet) Unmarshal(buf []byte) error {
 	n, err := p.Header.Unmarshal(buf)
 	if err != nil {
+		p.resetPayloadAndPadding()
+
 		return err
 	}
 
 	end := len(buf)
 	if p.Header.Padding {
+		// RFC 3550 Section 5.1: the last padding byte holds the number of padding
+		// bytes, including itself, and therefore must be at least one.
 		if end <= n {
+			p.resetPayloadAndPadding()
+
 			return errTooSmall
 		}
-		p.Header.PaddingSize = buf[end-1]
-		end -= int(p.Header.PaddingSize)
+
+		paddingSize := buf[end-1]
+		if paddingSize == 0 {
+			p.resetPayloadAndPadding()
+
+			return errInvalidRTPPadding
+		}
+
+		p.Header.PaddingSize = paddingSize
+		end -= int(paddingSize)
 	} else {
 		p.Header.PaddingSize = 0
 	}
 	p.PaddingSize = p.Header.PaddingSize
 	if end < n {
+		p.resetPayloadAndPadding()
+
 		return errTooSmall
 	}
 
 	p.Payload = buf[n:end]
 
 	return nil
+}
+
+// resetPayloadAndPadding clears payload and padding state so a failed Unmarshal
+// cannot leave data from a previously parsed packet behind.
+func (p *Packet) resetPayloadAndPadding() {
+	p.Payload = nil
+	p.Header.PaddingSize = 0
+	p.PaddingSize = 0
 }
 
 // Marshal serializes the header into bytes.

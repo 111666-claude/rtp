@@ -1206,6 +1206,206 @@ func TestUnmarshal_ErrorHandling(t *testing.T) {
 	}
 }
 
+// rtpHeaderWithPadding builds a minimal RTP packet whose padding bit is set in
+// the first byte. payloadAndPadding is appended after the 12 byte base header.
+func rtpHeaderWithPadding(t *testing.T, payloadAndPadding []byte) []byte {
+	t.Helper()
+
+	rawPkt := []byte{
+		0xa0, 0xe0, 0x69, 0x8f, // V=2, P=1, PT=96, Marker
+		0xd9, 0xc2, 0x93, 0xda, // Timestamp
+		0x1c, 0x64, 0x27, 0x82, // SSRC
+	}
+
+	return append(rawPkt, payloadAndPadding...)
+}
+
+func TestUnmarshalPadding(t *testing.T) {
+	t.Run("zero padding count is rejected", func(t *testing.T) {
+		// P=1, complete base header and payload, last byte (padding count) is 0x00.
+		rawPkt := rtpHeaderWithPadding(t, []byte{0x98, 0x36, 0xbe, 0x88, 0x00})
+
+		packet := &Packet{}
+		err := packet.Unmarshal(rawPkt)
+		assert.ErrorIs(t, err, errInvalidRTPPadding)
+		assert.Nil(t, packet.Payload, "failed Unmarshal must not leave a payload behind")
+		assert.EqualValues(t, 0, packet.Header.PaddingSize)
+		assert.EqualValues(t, 0, packet.PaddingSize)
+	})
+
+	t.Run("minimum padding count of one", func(t *testing.T) {
+		// P=1, four payload bytes and a single padding byte with count 1.
+		rawPkt := rtpHeaderWithPadding(t, []byte{0x98, 0x36, 0xbe, 0x88, 0x01})
+
+		packet := &Packet{}
+		assert.NoError(t, packet.Unmarshal(rawPkt))
+		assert.Equal(t, []byte{0x98, 0x36, 0xbe, 0x88}, packet.Payload)
+		assert.EqualValues(t, 1, packet.Header.PaddingSize)
+		assert.EqualValues(t, 1, packet.PaddingSize)
+
+		// Marshal round trip preserves the packet byte for byte.
+		marshaled, err := packet.Marshal()
+		assert.NoError(t, err)
+		assert.Equal(t, rawPkt, marshaled)
+	})
+
+	t.Run("padding count of four", func(t *testing.T) {
+		// P=1, one payload byte and four padding bytes, count stored in last byte.
+		rawPkt := rtpHeaderWithPadding(t, []byte{0x98, 0x00, 0x00, 0x00, 0x04})
+
+		packet := &Packet{}
+		assert.NoError(t, packet.Unmarshal(rawPkt))
+		assert.Equal(t, []byte{0x98}, packet.Payload)
+		assert.EqualValues(t, 4, packet.Header.PaddingSize)
+		assert.EqualValues(t, 4, packet.PaddingSize)
+
+		marshaled, err := packet.Marshal()
+		assert.NoError(t, err)
+		assert.Equal(t, rawPkt, marshaled)
+	})
+
+	t.Run("padding count larger than available bytes returns short packet error", func(t *testing.T) {
+		// P=1, one payload byte but the count claims six padding bytes.
+		rawPkt := rtpHeaderWithPadding(t, []byte{0x98, 0x06})
+
+		packet := &Packet{}
+		err := packet.Unmarshal(rawPkt)
+		assert.ErrorIs(t, err, errTooSmall)
+		assert.Nil(t, packet.Payload)
+		assert.EqualValues(t, 0, packet.Header.PaddingSize)
+		assert.EqualValues(t, 0, packet.PaddingSize)
+	})
+
+	t.Run("packet with only the header and padding count returns short packet error", func(t *testing.T) {
+		// P=1 and no byte after the header: the padding count itself is missing.
+		rawPkt := rtpHeaderWithPadding(t, nil)
+
+		packet := &Packet{}
+		err := packet.Unmarshal(rawPkt)
+		assert.ErrorIs(t, err, errTooSmall)
+		assert.Nil(t, packet.Payload)
+		assert.EqualValues(t, 0, packet.Header.PaddingSize)
+	})
+
+	t.Run("truncated packet keeps returning short packet error", func(t *testing.T) {
+		// P=1 and a header shorter than the fixed 12 bytes.
+		rawPkt := []byte{
+			0xa0, 0xe0, 0x69, 0x8f,
+			0xd9, 0xc2, 0x93, 0xda,
+			0x1c, 0x64, // SSRC truncated
+		}
+
+		packet := &Packet{}
+		err := packet.Unmarshal(rawPkt)
+		assert.ErrorIs(t, err, errHeaderSizeInsufficient)
+		assert.Nil(t, packet.Payload)
+		assert.EqualValues(t, 0, packet.Header.PaddingSize)
+		assert.EqualValues(t, 0, packet.PaddingSize)
+	})
+
+	t.Run("trailing zero without padding bit stays part of the payload", func(t *testing.T) {
+		// P=0: the trailing 0x00 is payload and must not trigger padding checks.
+		rawPkt := []byte{
+			0x80, 0xe0, 0x69, 0x8f, // V=2, P=0, Marker, PT=96
+			0xd9, 0xc2, 0x93, 0xda, // Timestamp
+			0x1c, 0x64, 0x27, 0x82, // SSRC
+			0x98, 0x36, 0xbe, 0x88, 0x00,
+		}
+
+		packet := &Packet{}
+		assert.NoError(t, packet.Unmarshal(rawPkt))
+		assert.False(t, packet.Header.Padding)
+		assert.Equal(t, rawPkt[12:], packet.Payload)
+		if assert.NotEmpty(t, packet.Payload) {
+			assert.Equal(t, byte(0x00), packet.Payload[len(packet.Payload)-1])
+		}
+		assert.EqualValues(t, 0, packet.Header.PaddingSize)
+		assert.EqualValues(t, 0, packet.PaddingSize)
+
+		marshaled, err := packet.Marshal()
+		assert.NoError(t, err)
+		assert.Equal(t, rawPkt, marshaled)
+	})
+}
+
+func TestUnmarshalPaddingWithCSRCExtensionAndMarker(t *testing.T) {
+	// Legal packet combining CSRC list, one-byte header extension, marker bit
+	// and padding. Unmarshal followed by Marshal must reproduce the wire bytes.
+	rawPkt := []byte{
+		0xb2, 0xe0, 0x69, 0x8f, // V=2, P=1, X=1, CC=2, Marker, PT=96
+		0xd9, 0xc2, 0x93, 0xda, // Timestamp
+		0x1c, 0x64, 0x27, 0x82, // SSRC
+		0x11, 0x11, 0x11, 0x11, // CSRC 1
+		0x22, 0x22, 0x22, 0x22, // CSRC 2
+		0xBE, 0xDE, 0x00, 0x01, // One-byte extension, 4 bytes
+		0x50, 0xAA, 0x00, 0x00, // Extension ID=5, len=1, padding
+		0x98, 0x36, // payload
+		0x00, 0x02, // two padding bytes, last one carries the count
+	}
+
+	packet := &Packet{}
+	assert.NoError(t, packet.Unmarshal(rawPkt))
+	assert.True(t, packet.Header.Padding)
+	assert.True(t, packet.Header.Extension)
+	assert.True(t, packet.Header.Marker)
+	assert.Len(t, packet.Header.CSRC, 2)
+	assert.Equal(t, uint32(0x11111111), packet.Header.CSRC[0])
+	assert.Equal(t, uint32(0x22222222), packet.Header.CSRC[1])
+	assert.Len(t, packet.Header.Extensions, 1)
+	assert.Equal(t, uint8(5), packet.Header.Extensions[0].id)
+	assert.Equal(t, []byte{0xAA}, packet.Header.Extensions[0].payload)
+	assert.Equal(t, []byte{0x98, 0x36}, packet.Payload)
+	assert.EqualValues(t, 2, packet.Header.PaddingSize)
+	assert.EqualValues(t, 2, packet.PaddingSize)
+
+	marshaled, err := packet.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, rawPkt, marshaled)
+	assert.Equal(t, len(rawPkt), packet.MarshalSize())
+}
+
+func TestUnmarshalPaddingErrorResetsPreviousState(t *testing.T) {
+	// First parse a fully valid padded packet so the Packet holds real state.
+	validPkt := rtpHeaderWithPadding(t, []byte{0x98, 0x36, 0xbe, 0x88, 0x01})
+
+	packet := &Packet{}
+	assert.NoError(t, packet.Unmarshal(validPkt))
+	assert.NotEmpty(t, packet.Payload)
+	assert.EqualValues(t, 1, packet.Header.PaddingSize)
+	assert.EqualValues(t, 1, packet.PaddingSize)
+
+	// A follow-up packet with P=1 and a zero padding count must fail and clear
+	// the payload and padding state left by the previous successful Unmarshal.
+	invalidPkt := rtpHeaderWithPadding(t, []byte{0x98, 0x36, 0xbe, 0x88, 0x00})
+	err := packet.Unmarshal(invalidPkt)
+	assert.ErrorIs(t, err, errInvalidRTPPadding)
+	assert.Nil(t, packet.Payload, "invalid packet must not retain the previous payload")
+	assert.EqualValues(t, 0, packet.Header.PaddingSize, "invalid packet must not retain the previous padding")
+	assert.EqualValues(t, 0, packet.PaddingSize)
+
+	// The same holds when the follow-up failure is an oversized padding count.
+	excessivePkt := rtpHeaderWithPadding(t, []byte{0x98, 0x36, 0xbe, 0x88, 0x01})
+	assert.NoError(t, packet.Unmarshal(excessivePkt))
+	truncatedPkt := rtpHeaderWithPadding(t, []byte{0x98, 0x06})
+	err = packet.Unmarshal(truncatedPkt)
+	assert.ErrorIs(t, err, errTooSmall)
+	assert.Nil(t, packet.Payload)
+	assert.EqualValues(t, 0, packet.Header.PaddingSize)
+	assert.EqualValues(t, 0, packet.PaddingSize)
+
+	// A later valid P=0 packet still parses and yields its own payload.
+	noPaddingPkt := []byte{
+		0x80, 0xe0, 0x69, 0x8f,
+		0xd9, 0xc2, 0x93, 0xda,
+		0x1c, 0x64, 0x27, 0x82,
+		0x98, 0x00,
+	}
+	assert.NoError(t, packet.Unmarshal(noPaddingPkt))
+	assert.Equal(t, []byte{0x98, 0x00}, packet.Payload)
+	assert.EqualValues(t, 0, packet.Header.PaddingSize)
+	assert.EqualValues(t, 0, packet.PaddingSize)
+}
+
 // https://github.com/pion/rtp/issues/275
 func TestUnmarshal_OneByteExtensionWithoutRTPPayload(t *testing.T) {
 	rawPkt := []byte{

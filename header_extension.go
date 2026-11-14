@@ -11,6 +11,8 @@ import (
 
 const (
 	headerExtensionIDReserved = 0xF
+
+	oneByteHeaderExtensionHeaderSize = 4
 )
 
 // HeaderExtension represents an RTP extension header.
@@ -31,16 +33,24 @@ type OneByteHeaderExtension struct {
 	payload []byte
 }
 
-// Set sets the extension payload for the specified ID.
-func (e *OneByteHeaderExtension) Set(id uint8, buf []byte) error {
-	if id < 1 || id > 14 {
-		return fmt.Errorf("%w actual(%d)", errRFC8285OneByteHeaderIDRange, id)
-	}
-	if len(buf) > 16 {
-		return fmt.Errorf("%w actual(%d)", errRFC8285OneByteHeaderSize, len(buf))
+// extensions parses the stored payload into an ordered list of extensions.
+// Malformed or truncated elements are treated as the end of the list instead
+// of causing out-of-bounds accesses.
+func (e *OneByteHeaderExtension) extensions() []Extension {
+	if len(e.payload) < oneByteHeaderExtensionHeaderSize {
+		return nil
 	}
 
-	for n := 4; n < len(e.payload); {
+	// Only the region described by the length field is meaningful.
+	end := oneByteHeaderExtensionHeaderSize +
+		int(binary.BigEndian.Uint16(e.payload[2:4]))*4
+	if end > len(e.payload) {
+		end = len(e.payload)
+	}
+
+	// Each element occupies at least two bytes (ID/length and one payload byte).
+	extensions := make([]Extension, 0, (end-oneByteHeaderExtensionHeaderSize)/2)
+	for n := oneByteHeaderExtensionHeaderSize; n < end; {
 		if e.payload[n] == 0x00 { // padding
 			n++
 
@@ -48,43 +58,104 @@ func (e *OneByteHeaderExtension) Set(id uint8, buf []byte) error {
 		}
 
 		extid := e.payload[n] >> 4
-		payloadLen := int(e.payload[n]&^0xF0 + 1)
+		// ID 0 is padding and 15 is reserved; neither may start an element.
+		if extid == headerExtensionIDReserved || extid == 0 {
+			break
+		}
+
+		payloadLen := int(e.payload[n]&^0xF0) + 1
 		n++
 
-		if extid == id {
-			e.payload = append(e.payload[:n+1], append(buf, e.payload[n+1+payloadLen:]...)...)
-
-			return nil
+		if n+payloadLen > end {
+			break
 		}
+
+		extensions = append(extensions, Extension{
+			id:      extid,
+			payload: e.payload[n : n+payloadLen],
+		})
 		n += payloadLen
 	}
-	e.payload = append(e.payload, (id<<4 | uint8(len(buf)-1))) // nolint: gosec // G115
-	e.payload = append(e.payload, buf...)
-	binary.BigEndian.PutUint16(e.payload[2:4], binary.BigEndian.Uint16(e.payload[2:4])+1)
+
+	return extensions
+}
+
+// setExtensions rebuilds the extension header from the given ordered list of
+// extensions. The length field is derived from the padded body so it can never
+// drift out of sync with the stored data.
+func (e *OneByteHeaderExtension) setExtensions(extensions []Extension) {
+	bodySize := 0
+	for _, extension := range extensions {
+		bodySize += 1 + len(extension.payload)
+	}
+
+	// The extension body must be padded to a 32-bit boundary.
+	roundedBodySize := ((bodySize + 3) / 4) * 4
+
+	payload := make([]byte, oneByteHeaderExtensionHeaderSize+roundedBodySize)
+	binary.BigEndian.PutUint16(payload[0:2], ExtensionProfileOneByte)
+	// nolint: gosec // G115 false positive, roundedBodySize/4 always fits
+	binary.BigEndian.PutUint16(payload[2:4], uint16(roundedBodySize/4))
+
+	n := oneByteHeaderExtensionHeaderSize
+	for _, extension := range extensions {
+		// nolint: gosec // G115 false positive, payload length is at most 16
+		payload[n] = extension.id<<4 | uint8(len(extension.payload)-1)
+		n++
+		n += copy(payload[n:], extension.payload)
+	}
+
+	e.payload = payload
+}
+
+// Set sets the extension payload for the specified ID.
+func (e *OneByteHeaderExtension) Set(id uint8, buf []byte) error {
+	if id < 1 || id > 14 {
+		return fmt.Errorf("%w actual(%d)", errRFC8285OneByteHeaderIDRange, id)
+	}
+	if len(buf) == 0 {
+		return fmt.Errorf("%w actual(%d)", errHeaderExtensionEmptyPayload, len(buf))
+	}
+	if len(buf) > 16 {
+		return fmt.Errorf("%w actual(%d)", errRFC8285OneByteHeaderSize, len(buf))
+	}
+
+	extensions := e.extensions()
+	updated := make([]Extension, 0, len(extensions)+1)
+	replaced := false
+	for _, extension := range extensions {
+		if extension.id != id {
+			updated = append(updated, extension)
+
+			continue
+		}
+
+		// A rewrite must leave exactly one entry for this ID, so drop duplicates.
+		if replaced {
+			continue
+		}
+
+		// setExtensions() copies the data, so a caller-owned buffer is never
+		// aliased into the stored payload.
+		updated = append(updated, Extension{id: id, payload: buf})
+		replaced = true
+	}
+
+	if !replaced {
+		updated = append(updated, Extension{id: id, payload: buf})
+	}
+
+	e.setExtensions(updated)
 
 	return nil
 }
 
 // GetIDs returns the available IDs.
 func (e *OneByteHeaderExtension) GetIDs() []uint8 {
-	ids := make([]uint8, 0, binary.BigEndian.Uint16(e.payload[2:4]))
-	for n := 4; n < len(e.payload); {
-		if e.payload[n] == 0x00 { // padding
-			n++
-
-			continue
-		}
-
-		extid := e.payload[n] >> 4
-		payloadLen := int(e.payload[n]&^0xF0 + 1)
-		n++
-
-		if extid == headerExtensionIDReserved {
-			break
-		}
-
-		ids = append(ids, extid)
-		n += payloadLen
+	extensions := e.extensions()
+	ids := make([]uint8, 0, len(extensions))
+	for _, extension := range extensions {
+		ids = append(ids, extension.id)
 	}
 
 	return ids
@@ -92,21 +163,10 @@ func (e *OneByteHeaderExtension) GetIDs() []uint8 {
 
 // Get returns the payload of the extension with the given ID.
 func (e *OneByteHeaderExtension) Get(id uint8) []byte {
-	for n := 4; n < len(e.payload); {
-		if e.payload[n] == 0x00 { // padding
-			n++
-
-			continue
+	for _, extension := range e.extensions() {
+		if extension.id == id {
+			return extension.payload
 		}
-
-		extid := e.payload[n] >> 4
-		payloadLen := int(e.payload[n]&^0xF0 + 1)
-		n++
-
-		if extid == id {
-			return e.payload[n : n+payloadLen]
-		}
-		n += payloadLen
 	}
 
 	return nil
@@ -114,22 +174,13 @@ func (e *OneByteHeaderExtension) Get(id uint8) []byte {
 
 // Del deletes the extension with the specified ID.
 func (e *OneByteHeaderExtension) Del(id uint8) error {
-	for n := 4; n < len(e.payload); {
-		if e.payload[n] == 0x00 { // padding
-			n++
-
-			continue
-		}
-
-		extid := e.payload[n] >> 4
-		payloadLen := int(e.payload[n]&^0xF0 + 1)
-
-		if extid == id {
-			e.payload = append(e.payload[:n], e.payload[n+1+payloadLen:]...)
+	extensions := e.extensions()
+	for i := range extensions {
+		if extensions[i].id == id {
+			e.setExtensions(append(extensions[:i:i], extensions[i+1:]...))
 
 			return nil
 		}
-		n += payloadLen + 1
 	}
 
 	return errHeaderExtensionNotFound
@@ -137,10 +188,20 @@ func (e *OneByteHeaderExtension) Del(id uint8) error {
 
 // Unmarshal parses the extension payload.
 func (e *OneByteHeaderExtension) Unmarshal(buf []byte) (int, error) {
+	if len(buf) < oneByteHeaderExtensionHeaderSize {
+		return 0, errTooSmall
+	}
+
 	profile := binary.BigEndian.Uint16(buf[0:2])
 	if profile != ExtensionProfileOneByte {
 		return 0, fmt.Errorf("%w actual(%x)", errHeaderExtensionNotFound, buf[0:2])
 	}
+
+	if extLen := oneByteHeaderExtensionHeaderSize +
+		int(binary.BigEndian.Uint16(buf[2:4]))*4; len(buf) < extLen {
+		return 0, errTooSmall
+	}
+
 	e.payload = buf
 
 	return len(buf), nil
@@ -148,7 +209,10 @@ func (e *OneByteHeaderExtension) Unmarshal(buf []byte) (int, error) {
 
 // Marshal returns the extension payload.
 func (e OneByteHeaderExtension) Marshal() ([]byte, error) {
-	return e.payload, nil
+	payload := make([]byte, len(e.payload))
+	copy(payload, e.payload)
+
+	return payload, nil
 }
 
 // MarshalTo writes the extension payload to the given buffer.

@@ -6,6 +6,7 @@ package codecs
 import (
 	"encoding/binary"
 	"errors"
+	"runtime"
 	"slices"
 	"testing"
 
@@ -22,10 +23,76 @@ func createTestH265Header(pType, layerID, tid uint8, f bool) H265NALUHeader {
 }
 
 func createTestH265NALU(pType uint8, payload []byte) []byte {
+	return createTestH265NALUWithLayer(pType, 0, payload)
+}
+
+func createTestH265NALUWithLayer(pType, layerID uint8, payload []byte) []byte {
 	nalu := make([]byte, 0, h265NaluHeaderSize+len(payload))
-	nalu = binary.BigEndian.AppendUint16(nalu, uint16(createTestH265Header(pType, 0, 1, false)))
+	nalu = binary.BigEndian.AppendUint16(nalu, uint16(createTestH265Header(pType, layerID, 1, false)))
 
 	return append(nalu, payload...)
+}
+
+func createTestH265ExpGolombPayload(prefixBits uint, value uint32) []byte {
+	codeNum := value + 1
+	var codeNumBits uint
+	for current := codeNum; current != 0; current >>= 1 {
+		codeNumBits++
+	}
+
+	payload := make([]byte, (prefixBits+2*codeNumBits-1+7)/8)
+	bitPos := prefixBits + codeNumBits - 1
+	for bit := codeNumBits; bit > 0; bit-- {
+		if codeNum&(uint32(1)<<(bit-1)) != 0 {
+			payload[bitPos/8] |= 1 << (7 - (bitPos % 8))
+		}
+		bitPos++
+	}
+
+	return payload
+}
+
+func createTestH265SpsPayload() []byte {
+	return createTestH265ExpGolombPayload(104, 0)
+}
+
+func createTestH265SpsWithSubLayerPayload() []byte {
+	payload := make([]byte, 28)
+	payload[0] = 0x02
+	payload[13] = 0xc0
+	payload[27] = 0x40
+
+	return payload
+}
+
+func createTestH265AnnexB(nalus ...[]byte) []byte {
+	var payload []byte
+	for _, nalu := range nalus {
+		payload = append(payload, annexbNALUStartCode...)
+		payload = append(payload, nalu...)
+	}
+
+	return payload
+}
+
+func assertH265AggregationPayload(t *testing.T, payload []byte, expected ...[]byte) {
+	t.Helper()
+
+	aggregation, err := parseH265AggregationPacket(payload, false)
+	assert.NoError(t, err)
+	if aggregation == nil {
+		return
+	}
+
+	packets, err := splitH265AggregationPacket(*aggregation)
+	assert.NoError(t, err)
+	if !assert.Len(t, packets, len(expected)) {
+		return
+	}
+
+	for i, packet := range packets {
+		assert.Equal(t, expected[i], packet.serialize(nil))
+	}
 }
 
 func TestH265_NALU_Header(t *testing.T) {
@@ -689,9 +756,9 @@ func TestH265Packetizer_Aggregated(t *testing.T) {
 func TestH265Payloader_Payload_VPS_SPS_PPS_handling(t *testing.T) {
 	packetizer := H265Payloader{}
 
-	vps := createTestH265NALU(h265NaluVpsType, []byte{0x00, 0x01})
-	sps := createTestH265NALU(h265NaluSpsType, []byte{0x02, 0x03})
-	pps := createTestH265NALU(h265NaluPpsType, []byte{0x04, 0x05})
+	vps := createTestH265NALU(h265NaluVpsType, []byte{0x00})
+	sps := createTestH265NALU(h265NaluSpsType, createTestH265SpsPayload())
+	pps := createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 0))
 	vcl := createTestH265NALU(19, []byte{0x06, 0x07})
 
 	assert.Empty(t, packetizer.Payload(1500, vps), "VPS should be cached")
@@ -714,22 +781,674 @@ func TestH265Payloader_Payload_VPS_SPS_PPS_handling(t *testing.T) {
 	assert.Equal(t, []byte{0x06, 0x07}, packets[3].payload)
 }
 
+func TestH265Payloader_Payload_MultipleParameterSets(t *testing.T) {
+	packetizer := H265Payloader{}
+
+	vps0 := createTestH265NALU(h265NaluVpsType, []byte{0x00})
+	vps1 := createTestH265NALU(h265NaluVpsType, []byte{0x10})
+	sps0 := createTestH265NALU(h265NaluSpsType, createTestH265SpsPayload())
+	pps0 := createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 0))
+	// For an enhancement layer, 7 signals multi_layer_ext_sps_flag. The SPS
+	// ID then follows immediately, without profile_tier_level.
+	sps1 := createTestH265NALUWithLayer(h265NaluSpsType, 1, []byte{0x0e, 0xa0})
+	pps1 := createTestH265NALUWithLayer(h265NaluPpsType, 1, createTestH265ExpGolombPayload(0, 1))
+	vcl0 := createTestH265NALU(19, []byte{0x06})
+	vcl1 := createTestH265NALUWithLayer(19, 1, []byte{0x07})
+
+	payloads := packetizer.Payload(1500, createTestH265AnnexB(vps0, vps1, sps0, pps0, sps1, pps1, vcl0, vcl1))
+	if !assert.Len(t, payloads, 1) {
+		return
+	}
+	assertH265AggregationPayload(t, payloads[0], vps0, vps1, sps0, pps0, sps1, pps1, vcl0, vcl1)
+}
+
+func TestH265Payloader_Payload_ReplacesSameIDParameterSetsAcrossLayers(t *testing.T) {
+	packetizer := H265Payloader{}
+
+	vps := createTestH265NALU(h265NaluVpsType, []byte{0x00})
+	baseLayerSps := createTestH265NALU(h265NaluSpsType, createTestH265SpsPayload())
+	pps := createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 0))
+	enhancementLayerSps := createTestH265NALUWithLayer(h265NaluSpsType, 1, []byte{0x0f})
+	vcl := createTestH265NALUWithLayer(19, 1, []byte{0x06})
+
+	payloads := packetizer.Payload(1500, createTestH265AnnexB(vps, baseLayerSps, pps, enhancementLayerSps, vcl))
+	if !assert.Len(t, payloads, 1) {
+		return
+	}
+	assertH265AggregationPayload(t, payloads[0], vps, pps, enhancementLayerSps, vcl)
+}
+
+func TestH265Payloader_Payload_ReplacesPendingParameterSet(t *testing.T) {
+	packetizer := H265Payloader{}
+
+	spsOriginal := createTestH265NALU(h265NaluSpsType, createTestH265SpsPayload())
+	spsUpdate := append([]byte(nil), spsOriginal...)
+	spsUpdate[len(spsUpdate)-1] ^= 0x01
+	pps := createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 0))
+	sei := createTestH265NALU(39, []byte{0x04})
+	vcl := createTestH265NALU(20, []byte{0x05})
+
+	payloads := packetizer.Payload(1500, createTestH265AnnexB(spsOriginal, pps, spsUpdate, sei, vcl))
+	if !assert.Len(t, payloads, 1) {
+		return
+	}
+	assertH265AggregationPayload(t, payloads[0], pps, spsUpdate, sei, vcl)
+}
+
+func TestH265Payloader_Payload_OrdersUpdatedParameterSets(t *testing.T) {
+	packetizer := H265Payloader{}
+
+	vps0 := createTestH265NALU(h265NaluVpsType, []byte{0x00})
+	vps1 := createTestH265NALU(h265NaluVpsType, []byte{0x10})
+	sps0 := createTestH265NALU(h265NaluSpsType, createTestH265SpsPayload())
+	sps1Payload := append([]byte(nil), createTestH265SpsPayload()...)
+	sps1Payload[0] |= 0x10
+	sps1Payload[len(sps1Payload)-1] ^= 0x01
+	sps1 := createTestH265NALU(h265NaluSpsType, sps1Payload)
+	pps := createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 0))
+	sei := createTestH265NALU(39, []byte{0x04})
+	idr := createTestH265NALU(19, []byte{0x05})
+
+	payloads := packetizer.Payload(1500, createTestH265AnnexB(vps0, sps0, pps, vps1, sps1, pps, sei, idr))
+	if !assert.Len(t, payloads, 1) {
+		return
+	}
+	assertH265AggregationPayload(t, payloads[0], vps0, vps1, sps1, pps, sei, idr)
+}
+
+func TestH265Payloader_Payload_ReplacesRepeatedParameterSet(t *testing.T) {
+	packetizer := H265Payloader{}
+
+	vpsA := createTestH265NALU(h265NaluVpsType, []byte{0x00, 0x01})
+	vpsB := createTestH265NALU(h265NaluVpsType, []byte{0x00, 0x02})
+	vcl := createTestH265NALU(19, []byte{0x06})
+
+	payloads := packetizer.Payload(1500, createTestH265AnnexB(vpsA, vpsB, vpsA, vcl))
+	if !assert.Len(t, payloads, 1) {
+		return
+	}
+	assertH265AggregationPayload(t, payloads[0], vpsA, vcl)
+}
+
+func TestH265Payloader_Payload_UsesLatestPendingConfiguration(t *testing.T) {
+	packetizer := H265Payloader{}
+
+	vpsA := createTestH265NALU(h265NaluVpsType, []byte{0x00, 0x01})
+	vpsB := createTestH265NALU(h265NaluVpsType, []byte{0x00, 0x02})
+	spsA := createTestH265NALU(h265NaluSpsType, createTestH265SpsPayload())
+	ppsA := createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 0))
+	vclA := createTestH265NALU(20, []byte{0x06})
+
+	payloads := packetizer.Payload(1500, createTestH265AnnexB(
+		vpsA, spsA, ppsA,
+		vpsB,
+		vpsA, spsA, ppsA,
+		vclA,
+	))
+	if !assert.Len(t, payloads, 1) {
+		return
+	}
+	assertH265AggregationPayload(t, payloads[0], vpsA, spsA, ppsA, vclA)
+}
+
+func TestH265Payloader_Payload_PreservesParameterSetOrder(t *testing.T) {
+	pps0 := createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 0))
+	pps1 := createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 1))
+	vcl := createTestH265NALU(19, []byte{0x06})
+	payload := createTestH265AnnexB(pps0, pps1, vcl)
+
+	for range 100 {
+		packetizer := H265Payloader{}
+		payloads := packetizer.Payload(1500, payload)
+		if !assert.Len(t, payloads, 1) {
+			return
+		}
+		assertH265AggregationPayload(t, payloads[0], pps0, pps1, vcl)
+	}
+}
+
+func TestH265ParameterSetIDs_RejectTruncatedInput(t *testing.T) {
+	tests := []struct {
+		name  string
+		parse func() (uint32, bool)
+	}{
+		{
+			name: "VPS",
+			parse: func() (uint32, bool) {
+				return h265VpsID(nil)
+			},
+		},
+		{
+			name: "PPS",
+			parse: func() (uint32, bool) {
+				return h265PpsID([]byte{0x00})
+			},
+		},
+		{
+			name: "SPS",
+			parse: func() (uint32, bool) {
+				return h265SpsID(0, []byte{0x00})
+			},
+		},
+		{
+			name: "empty SPS",
+			parse: func() (uint32, bool) {
+				return h265SpsID(0, nil)
+			},
+		},
+		{
+			name: "base-layer multilayer extension",
+			parse: func() (uint32, bool) {
+				return h265SpsID(0, []byte{0x0e})
+			},
+		},
+		{
+			name: "multilayer SPS",
+			parse: func() (uint32, bool) {
+				return h265SpsID(1, []byte{0x0e})
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			id, ok := test.parse()
+			assert.False(t, ok)
+			assert.Zero(t, id)
+		})
+	}
+}
+
+func TestH265SpsID_ProfileTierLevelWithSubLayer(t *testing.T) {
+	id, ok := h265SpsID(0, createTestH265SpsWithSubLayerPayload())
+
+	assert.True(t, ok)
+	assert.Equal(t, uint32(1), id)
+}
+
+func TestH265SkipProfileTierLevel_RejectsTruncatedInput(t *testing.T) {
+	tests := []struct {
+		name   string
+		length int
+		flags  byte
+	}{
+		{name: "general profile", length: 3},
+		{name: "general compatibility", length: 4},
+		{name: "general constraint flags", length: 8},
+		{name: "general level", length: 11},
+		{name: "sub-layer flags", length: 12},
+		{name: "reserved bits", length: 13},
+		{name: "sub-layer profile space", length: 14, flags: 0x80},
+		{name: "sub-layer profile idc", length: 18, flags: 0x80},
+		{name: "sub-layer constraint flags", length: 22, flags: 0x80},
+		{name: "sub-layer level", length: 25, flags: 0xc0},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data := make([]byte, test.length)
+			if len(data) > 12 {
+				data[12] = test.flags
+			}
+			reader := h265ParamBits{data: data}
+			assert.False(t, h265SkipProfileTierLevel(&reader, 1))
+		})
+	}
+}
+
+func TestH265ParamBits_RejectsMalformedExpGolomb(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "more than 31 leading zeroes",
+			data: make([]byte, 4),
+		},
+		{
+			name: "missing suffix",
+			data: []byte{0x01},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reader := h265ParamBits{data: test.data}
+			_, ok := reader.ue()
+			assert.False(t, ok)
+		})
+	}
+}
+
+func TestH265Payloader_Payload_ForwardsOutOfRangeParameterSetID(t *testing.T) {
+	packetizer := H265Payloader{}
+	pps := createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, h265MaxPpsCount))
+	vcl := createTestH265NALU(19, []byte{0x06})
+
+	payloads := packetizer.Payload(1500, createTestH265AnnexB(pps, vcl))
+	if !assert.Len(t, payloads, 1) {
+		return
+	}
+	assertH265AggregationPayload(t, payloads[0], pps, vcl)
+}
+
+func TestH265Payloader_Payload_ForwardsTruncatedParameterSet(t *testing.T) {
+	packetizer := H265Payloader{}
+	truncatedPps := createTestH265NALU(h265NaluPpsType, []byte{0x00})
+	vcl := createTestH265NALU(19, []byte{0x06})
+
+	payloads := packetizer.Payload(1500, createTestH265AnnexB(truncatedPps, vcl))
+	if !assert.Len(t, payloads, 1) {
+		return
+	}
+	assertH265AggregationPayload(t, payloads[0], truncatedPps, vcl)
+}
+
+func TestH265Payloader_Payload_ForwardsUnparseableParameterSets(t *testing.T) {
+	packetizer := H265Payloader{}
+	vps := createTestH265NALU(h265NaluVpsType, nil)
+	sps := createTestH265NALU(h265NaluSpsType, nil)
+	pps := createTestH265NALU(h265NaluPpsType, []byte{0x00})
+	vcl := createTestH265NALU(19, []byte{0x06})
+
+	payloads := packetizer.Payload(1500, createTestH265AnnexB(vps, sps, pps, vcl))
+	if !assert.Len(t, payloads, 3) {
+		return
+	}
+	assert.Equal(t, vps, payloads[0])
+	assert.Equal(t, sps, payloads[1])
+	assertH265AggregationPayload(t, payloads[2], pps, vcl)
+}
+
+func TestH265Payloader_Payload_UnparseableParameterSetDoesNotPolluteCache(t *testing.T) {
+	packetizer := H265Payloader{}
+
+	validVps := createTestH265NALU(h265NaluVpsType, []byte{0x00})
+	// An empty VPS carries no ID and must not be cached under a guessed ID.
+	brokenVps := createTestH265NALU(h265NaluVpsType, nil)
+	// An SPS whose ID is out of range must not be cached.
+	outOfRangeSps := createTestH265NALU(
+		h265NaluSpsType,
+		createTestH265ExpGolombPayload(104, h265MaxSpsCount),
+	) //nolint:gosec // bounded
+	vcl := createTestH265NALU(19, []byte{0x06})
+
+	assert.Empty(t, packetizer.Payload(1500, validVps))
+	if !assert.NotNil(t, packetizer.cache) || !assert.Len(t, packetizer.cache.entries, 1) {
+		return
+	}
+
+	// The broken VPS is forwarded inline instead of being cached, and it must
+	// not leave an entry behind.
+	assert.NotEmpty(t, packetizer.Payload(1500, brokenVps))
+	assert.Nil(t, packetizer.cache)
+
+	// Same for a parameter set whose ID is outside the valid range.
+	assert.NotEmpty(t, packetizer.Payload(1500, outOfRangeSps))
+	assert.Nil(t, packetizer.cache)
+
+	// The payloader remains usable for a subsequent, unrelated frame.
+	nextVps := createTestH265NALU(h265NaluVpsType, []byte{0x10})
+	assert.Empty(t, packetizer.Payload(1500, nextVps))
+
+	payloads := packetizer.Payload(1500, vcl)
+	if !assert.Len(t, payloads, 1) {
+		return
+	}
+	assertH265AggregationPayload(t, payloads[0], nextVps, vcl)
+}
+
+func TestH265Payloader_Payload_VCLOnlyDoesNotCreateParameterSetCache(t *testing.T) {
+	packetizer := H265Payloader{}
+
+	packetizer.Payload(1500, createTestH265NALU(19, []byte{0x06}))
+
+	assert.Nil(t, packetizer.cache)
+}
+
+func TestH265Payloader_Payload_ReplacesParameterSetOnlyCache(t *testing.T) {
+	const (
+		parameterSetCount = 1000
+		mtu               = 20
+	)
+
+	packetizer := H265Payloader{}
+	vcl := createTestH265NALU(19, []byte{0x06})
+	var latestVps []byte
+
+	for i := range parameterSetCount {
+		latestVps = createTestH265NALU(h265NaluVpsType, []byte{0x00, byte(i)})
+		assert.Empty(t, packetizer.Payload(mtu, latestVps))
+		if packetizer.cache != nil {
+			assert.Len(t, packetizer.cache.entries, 1)
+			assert.LessOrEqual(t, cap(packetizer.cache.entries), 4)
+		}
+	}
+
+	payloads := packetizer.Payload(mtu, vcl)
+	assert.Nil(t, packetizer.cache)
+	if !assert.Len(t, payloads, 1) {
+		return
+	}
+	assertH265AggregationPayload(t, payloads[0], latestVps, vcl)
+}
+
+func TestH265Payloader_Payload_CopiesCachedParameterSet(t *testing.T) {
+	packetizer := H265Payloader{}
+	sps := createTestH265NALU(h265NaluSpsType, createTestH265SpsPayload())
+	filler := createTestH265NALU(h265NaluFillerType, make([]byte, 1024))
+
+	assert.Empty(t, packetizer.Payload(1500, createTestH265AnnexB(sps, filler)))
+	if !assert.NotNil(t, packetizer.cache) || !assert.Len(t, packetizer.cache.entries, 1) {
+		return
+	}
+	cached := packetizer.cache.entries[0].packet.payload
+	assert.Equal(t, sps[h265NaluHeaderSize:], cached)
+	assert.Equal(t, len(cached), cap(cached))
+}
+
+func TestH265Payloader_Payload_DefersLargeParameterSetUntilVCL(t *testing.T) {
+	const mtu = 20
+
+	packetizer := H265Payloader{}
+	smallVps := createTestH265NALU(h265NaluVpsType, []byte{0x00})
+	largeVpsPayload := make([]byte, 50)
+	largeVps := createTestH265NALU(h265NaluVpsType, largeVpsPayload)
+
+	assert.Empty(t, packetizer.Payload(mtu, smallVps))
+	assert.Empty(t, packetizer.Payload(mtu, largeVps))
+	assert.NotNil(t, packetizer.cache)
+	assert.Len(t, packetizer.cache.entries, 1)
+
+	vcl := createTestH265NALU(19, []byte{0x06})
+	payloads := packetizer.Payload(mtu, vcl)
+	if !assert.Greater(t, len(payloads), 1) {
+		return
+	}
+	for _, payload := range payloads[:len(payloads)-1] {
+		header := H265NALUHeader(binary.BigEndian.Uint16(payload))
+		assert.True(t, header.IsFragmentationUnit())
+	}
+	assert.Equal(t, vcl, payloads[len(payloads)-1])
+	assert.Nil(t, packetizer.cache)
+}
+
+func TestH265Payloader_Payload_CachesLargeParameterSetsWithoutExtraIDExtractionAllocation(t *testing.T) {
+	const mtu = 60000
+
+	spsPayload := createTestH265SpsPayload()
+	spsPayload = append(spsPayload, make([]byte, int(mtu)-len(spsPayload))...)
+	sps := createTestH265NALU(h265NaluSpsType, spsPayload)
+	vps := createTestH265NALU(h265NaluVpsType, make([]byte, len(spsPayload)))
+
+	vpsAllocs := testing.AllocsPerRun(10, func() {
+		packetizer := H265Payloader{}
+		packetizer.Payload(mtu, vps)
+	})
+	spsAllocs := testing.AllocsPerRun(10, func() {
+		packetizer := H265Payloader{}
+		packetizer.Payload(mtu, sps)
+	})
+
+	assert.Equal(t, vpsAllocs, spsAllocs)
+}
+
+func TestH265Payloader_Payload_KeepsDistinctIDsPerType(t *testing.T) {
+	packetizer := H265Payloader{}
+
+	vps0 := createTestH265NALU(h265NaluVpsType, []byte{0x00})
+	vps1 := createTestH265NALU(h265NaluVpsType, []byte{0x10})
+	sps0 := createTestH265NALU(h265NaluSpsType, createTestH265SpsPayload())
+	pps0 := createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 0))
+	pps1 := createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 1))
+	vcl := createTestH265NALU(19, []byte{0x06})
+
+	payloads := packetizer.Payload(1500, createTestH265AnnexB(vps0, vps1, sps0, pps0, pps1, vcl))
+	if !assert.Len(t, payloads, 1) {
+		return
+	}
+	// Every parameter set is present exactly once and in order.
+	assertH265AggregationPayload(t, payloads[0], vps0, vps1, sps0, pps0, pps1, vcl)
+}
+
+func TestH265Payloader_Payload_ReplacingIDKeepsOtherIDs(t *testing.T) {
+	packetizer := H265Payloader{}
+
+	vps0 := createTestH265NALU(h265NaluVpsType, []byte{0x00})
+	vps1 := createTestH265NALU(h265NaluVpsType, []byte{0x10})
+	vps1Updated := createTestH265NALU(h265NaluVpsType, []byte{0x10, 0x01})
+	sps0 := createTestH265NALU(h265NaluSpsType, createTestH265SpsPayload())
+	vcl := createTestH265NALU(19, []byte{0x06})
+
+	payloads := packetizer.Payload(1500, createTestH265AnnexB(vps0, vps1, sps0, vps1Updated, vcl))
+	if !assert.Len(t, payloads, 1) {
+		return
+	}
+	// vps0 and sps0 survive the replacement of vps1, which moves to the position
+	// of its latest occurrence.
+	assertH265AggregationPayload(t, payloads[0], vps0, sps0, vps1Updated, vcl)
+}
+
+func TestH265Payloader_Payload_EmptyInputKeepsCacheAndReturnsNothing(t *testing.T) {
+	packetizer := H265Payloader{}
+	vps := createTestH265NALU(h265NaluVpsType, []byte{0x00})
+
+	assert.Empty(t, packetizer.Payload(1500, nil))
+	assert.Empty(t, packetizer.Payload(1500, vps))
+	// An empty payload must not flush the pending parameter sets.
+	assert.Empty(t, packetizer.Payload(1500, nil))
+	if !assert.NotNil(t, packetizer.cache) {
+		return
+	}
+	assert.Len(t, packetizer.cache.entries, 1)
+
+	vcl := createTestH265NALU(19, []byte{0x06})
+	payloads := packetizer.Payload(1500, vcl)
+	if !assert.Len(t, payloads, 1) {
+		return
+	}
+	assertH265AggregationPayload(t, payloads[0], vps, vcl)
+}
+
+func TestH265Payloader_Payload_CacheDoesNotLeakBetweenFrames(t *testing.T) {
+	packetizer := H265Payloader{}
+
+	vps := createTestH265NALU(h265NaluVpsType, []byte{0x00})
+	sps := createTestH265NALU(h265NaluSpsType, createTestH265SpsPayload())
+	pps := createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 0))
+	vcl := createTestH265NALU(19, []byte{0x06})
+
+	first := packetizer.Payload(1500, createTestH265AnnexB(vps, sps, pps, vcl))
+	if !assert.Len(t, first, 1) {
+		return
+	}
+	assertH265AggregationPayload(t, first[0], vps, sps, pps, vcl)
+
+	// The same payloader must not carry the previous frame's parameter sets
+	// into an unrelated frame.
+	second := packetizer.Payload(1500, vcl)
+	if !assert.Len(t, second, 1) {
+		return
+	}
+	assert.Equal(t, vcl, second[0])
+}
+
+func TestH265Payloader_Payload_LinearWithManyParameterSetUpdates(t *testing.T) {
+	const updates = 6000
+
+	mtu := uint16(1500)
+	packetizer := H265Payloader{}
+	vcl := createTestH265NALU(19, []byte{0x06})
+
+	// Cycle through every valid ID so replacements and insertions both occur.
+	for i := range updates {
+		typ := []uint8{h265NaluVpsType, h265NaluSpsType, h265NaluPpsType}[i%3]
+		var nalu []byte
+
+		switch typ {
+		case h265NaluVpsType:
+			nalu = createTestH265NALU(typ, []byte{byte(i%h265MaxVpsCount) << 4})
+		case h265NaluSpsType:
+			spsID := uint32(i % h265MaxSpsCount) //nolint:gosec // bounded
+			nalu = createTestH265NALU(typ, createTestH265ExpGolombPayload(104, spsID))
+		default:
+			ppsID := uint32(i % h265MaxPpsCount) //nolint:gosec // bounded
+			nalu = createTestH265NALU(typ, createTestH265ExpGolombPayload(0, ppsID))
+		}
+		assert.Empty(t, packetizer.Payload(mtu, nalu))
+	}
+
+	if !assert.NotNil(t, packetizer.cache) {
+		return
+	}
+	// The cache is bounded by the parameter-set ID spaces, not by the number
+	// of updates, and each parameter set is stored once.
+	assert.LessOrEqual(t, len(packetizer.cache.entries), h265MaxVpsCount+h265MaxSpsCount+h265MaxPpsCount)
+
+	payloads := packetizer.Payload(mtu, vcl)
+	if !assert.NotEmpty(t, payloads) {
+		return
+	}
+	for _, payload := range payloads {
+		assert.LessOrEqual(t, len(payload), int(mtu), "payload must not exceed MTU")
+	}
+	assert.Nil(t, packetizer.cache)
+}
+
+func TestH265Payloader_Payload_UpdatesAreLinearInParameterSetCount(t *testing.T) {
+	const (
+		updates       = 6000
+		payloadLength = 64
+	)
+
+	// Cycle through every valid ID with a payload of a fixed size. A cache that
+	// copies all of its history on every update would allocate
+	// O(updates * cached sets * payloadLength); a linear cache only allocates
+	// the new payload once per update.
+	nalus := make([][]byte, 0, updates)
+	payload := make([]byte, payloadLength)
+	for i := range updates {
+		id := i % h265MaxVpsCount
+		payload[0] = byte(id) << 4
+		nalus = append(nalus, createTestH265NALU(h265NaluVpsType, payload))
+	}
+
+	packetizer := H265Payloader{}
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for _, nalu := range nalus {
+		packetizer.Payload(1500, nalu)
+	}
+	runtime.ReadMemStats(&after)
+
+	allocated := after.TotalAlloc - before.TotalAlloc
+	linear := uint64(updates * payloadLength * 4) // generous constant per update
+	assert.LessOrEqual(t, allocated, linear,
+		"parameter set updates must not copy the whole cache, allocated %d bytes", allocated)
+	assert.Len(t, packetizer.cache.entries, h265MaxVpsCount)
+}
+
+func TestH265Payloader_Payload_AggregationRespectsMTUBoundary(t *testing.T) {
+	vps := createTestH265NALU(h265NaluVpsType, []byte{0x00})
+	sps := createTestH265NALU(h265NaluSpsType, createTestH265SpsPayload())
+	pps := createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 0))
+	vcl := createTestH265NALU(19, []byte{0x06})
+	payload := createTestH265AnnexB(vps, sps, pps, vcl)
+
+	// MTU large enough for all parameter sets plus the VCL: one aggregation.
+	packetizer := H265Payloader{}
+	aggregated := packetizer.Payload(1500, payload)
+	if assert.Len(t, aggregated, 1) {
+		assert.LessOrEqual(t, len(aggregated[0]), 1500)
+		assertH265AggregationPayload(t, aggregated[0], vps, sps, pps, vcl)
+	}
+
+	// Exactly the wire size of the aggregation: still a single packet.
+	total := len(aggregated[0])
+	packetizer = H265Payloader{}
+	boundary := packetizer.Payload(uint16(total), payload) //nolint:gosec // bounded test size
+	if assert.Len(t, boundary, 1) {
+		assert.Len(t, boundary[0], total)
+	}
+
+	// One byte tighter: the payload must be split.
+	packetizer = H265Payloader{}
+	split := packetizer.Payload(uint16(total-1), payload) //nolint:gosec // bounded test size
+	assert.Greater(t, len(split), 1, "payload larger than MTU must be split")
+	for _, packet := range split {
+		assert.LessOrEqual(t, len(packet), total-1, "every packet must fit the MTU")
+	}
+}
+
+func TestH265Payloader_Payload_LargeParameterSetFragmentedWithinMTU(t *testing.T) {
+	const mtu = 40
+
+	packetizer := H265Payloader{}
+	largeVpsPayload := make([]byte, 100)
+	largeVps := createTestH265NALU(h265NaluVpsType, largeVpsPayload)
+	vcl := createTestH265NALU(19, []byte{0x06})
+
+	assert.Empty(t, packetizer.Payload(mtu, largeVps))
+
+	payloads := packetizer.Payload(mtu, vcl)
+	if !assert.Greater(t, len(payloads), 1) {
+		return
+	}
+	for _, packet := range payloads {
+		assert.LessOrEqual(t, len(packet), mtu)
+	}
+	assert.Equal(t, vcl, payloads[len(payloads)-1])
+}
+
+func BenchmarkH265Payloader_Payload_VCLOnly(b *testing.B) {
+	packetizer := H265Payloader{}
+	payload := createTestH265NALU(19, []byte{0x06})
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		packetizer.Payload(1500, payload)
+	}
+}
+
+func BenchmarkH265Payloader_Payload_ParameterSets(b *testing.B) {
+	packetizer := H265Payloader{}
+	payload := createTestH265AnnexB(
+		createTestH265NALU(h265NaluVpsType, []byte{0x00}),
+		createTestH265NALU(h265NaluSpsType, createTestH265SpsPayload()),
+		createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 0)),
+		createTestH265NALU(19, []byte{0x06}),
+	)
+	var payloads [][]byte
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		payloads = packetizer.Payload(1500, payload)
+	}
+	if len(payloads) == 0 {
+		b.Fatal("expected packetized payload")
+	}
+}
+
 func TestH265Payloader_Payload_VPS_SPS_PPS_before_fragmented(t *testing.T) {
 	packetizer := H265Payloader{}
 
-	assert.Empty(t, packetizer.Payload(20, createTestH265NALU(h265NaluVpsType, []byte{0x00, 0x01})))
-	assert.Empty(t, packetizer.Payload(20, createTestH265NALU(h265NaluSpsType, []byte{0x02, 0x03})))
-	assert.Empty(t, packetizer.Payload(20, createTestH265NALU(h265NaluPpsType, []byte{0x04, 0x05})))
+	assert.Empty(t, packetizer.Payload(40, createTestH265NALU(h265NaluVpsType, []byte{0x00})))
+	assert.Empty(t, packetizer.Payload(40, createTestH265NALU(h265NaluSpsType, createTestH265SpsPayload())))
+	assert.Empty(t, packetizer.Payload(40, createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 0))))
 
 	payload := make([]byte, 50)
 	for i := range payload {
 		payload[i] = uint8(i) //nolint:gosec // G115 test data
 	}
-	payloads := packetizer.Payload(20, createTestH265NALU(19, payload))
+	payloads := packetizer.Payload(40, createTestH265NALU(19, payload))
 	assert.Greater(t, len(payloads), 1)
 
 	aggregation, err := parseH265AggregationPacket(payloads[0], false)
-	assert.NoError(t, err)
+	if !assert.NoError(t, err) {
+		return
+	}
 
 	packets, err := splitH265AggregationPacket(*aggregation)
 	assert.NoError(t, err)

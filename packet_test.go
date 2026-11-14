@@ -1670,3 +1670,237 @@ func BenchmarkUnmarshalHeader(b *testing.B) {
 		}
 	})
 }
+
+// Anchor regression: after deleting the last extension Marshal must not write
+// the X bit, the profile or any extension bytes.
+func TestRFC8285DelLastExtensionClearsMarshalState(t *testing.T) {
+	anchor := func() *Packet {
+		return &Packet{
+			Header: Header{
+				Version:          2,
+				Padding:          true,
+				Marker:           true,
+				Extension:        true,
+				PayloadType:      96,
+				SequenceNumber:   27023,
+				Timestamp:        3653407706,
+				SSRC:             476325762,
+				PaddingSize:      4,
+				ExtensionProfile: ExtensionProfileOneByte,
+				Extensions: []Extension{
+					{1, []byte{0xAA}},
+				},
+			},
+			Payload: []byte{0x98},
+		}
+	}
+
+	packet := anchor()
+	withExtension, err := packet.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{
+		0xb0, 0xe0, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
+		0x27, 0x82, 0xBE, 0xDE, 0x00, 0x01, 0x10, 0xAA, 0x00, 0x00, 0x98, 0x00, 0x00, 0x00, 0x04,
+	}, withExtension)
+
+	payloadBefore := append([]byte(nil), packet.Payload...)
+	assert.NoError(t, packet.DelExtension(1))
+
+	assert.False(t, packet.Extension, "X bit state should be cleared")
+	assert.Zero(t, packet.ExtensionProfile, "profile should be cleared")
+	assert.Nil(t, packet.Extensions, "extension list should be cleared")
+	assert.True(t, packet.Marker, "marker must be preserved")
+	assert.True(t, packet.Padding, "padding flag must be preserved")
+	assert.Equal(t, byte(4), packet.Header.PaddingSize, "padding size must be preserved")
+	assert.Equal(t, uint16(27023), packet.SequenceNumber)
+	assert.Equal(t, uint32(3653407706), packet.Timestamp)
+	assert.Equal(t, uint32(476325762), packet.SSRC)
+	assert.Equal(t, payloadBefore, packet.Payload, "payload must not be modified")
+
+	withoutExtension, err := packet.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{
+		0xa0, 0xe0, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
+		0x27, 0x82, 0x98, 0x00, 0x00, 0x00, 0x04,
+	}, withoutExtension)
+	assert.Equal(t, packet.MarshalSize(), len(withoutExtension))
+
+	// The marshaled bytes must unmarshal into a packet with the original payload.
+	roundTrip := &Packet{}
+	assert.NoError(t, roundTrip.Unmarshal(withoutExtension))
+	assert.False(t, roundTrip.Extension)
+	assert.Empty(t, roundTrip.GetExtensionIDs())
+	assert.Equal(t, payloadBefore, roundTrip.Payload)
+	assert.True(t, roundTrip.Padding)
+	assert.Equal(t, byte(4), roundTrip.PaddingSize)
+
+	// Deleting again must report an error and leave the packet unchanged.
+	assert.ErrorIs(t, packet.DelExtension(1), errHeaderExtensionsNotEnabled)
+	unchanged, err := packet.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, withoutExtension, unchanged)
+}
+
+func TestRFC8285DelMiddleExtensionPreservesOthers(t *testing.T) {
+	newPacket := func() *Packet {
+		return &Packet{
+			Header: Header{
+				Version:          2,
+				Marker:           true,
+				Extension:        true,
+				PayloadType:      96,
+				SequenceNumber:   1,
+				Timestamp:        2,
+				SSRC:             3,
+				CSRC:             []uint32{0x1111, 0x2222},
+				ExtensionProfile: ExtensionProfileOneByte,
+				Extensions: []Extension{
+					{1, []byte{0xAA}},
+					{2, []byte{0xBB, 0xCC}},
+					{3, []byte{0xDD}},
+				},
+			},
+			Payload: []byte{0x98, 0x36},
+		}
+	}
+
+	packet := newPacket()
+	assert.NoError(t, packet.DelExtension(2))
+
+	assert.True(t, packet.Extension, "X bit state must stay set while extensions remain")
+	assert.Equal(t, uint16(ExtensionProfileOneByte), packet.ExtensionProfile)
+	assert.Equal(t, []uint8{1, 3}, packet.GetExtensionIDs(), "remaining order must be preserved")
+	assert.Equal(t, []byte{0xAA}, packet.GetExtension(1))
+	assert.Nil(t, packet.GetExtension(2))
+	assert.Equal(t, []byte{0xDD}, packet.GetExtension(3))
+	assert.Equal(t, []uint32{0x1111, 0x2222}, packet.CSRC, "CSRC must be preserved")
+
+	raw, err := packet.Marshal()
+	assert.NoError(t, err)
+
+	roundTrip := &Packet{}
+	assert.NoError(t, roundTrip.Unmarshal(raw))
+	assert.Equal(t, []uint8{1, 3}, roundTrip.GetExtensionIDs())
+	assert.Equal(t, []byte{0xAA}, roundTrip.GetExtension(1))
+	assert.Equal(t, []byte{0xDD}, roundTrip.GetExtension(3))
+	assert.Equal(t, []uint32{0x1111, 0x2222}, roundTrip.CSRC)
+	assert.Equal(t, []byte{0x98, 0x36}, roundTrip.Payload)
+
+	// Deleting a missing ID must error and not mutate the packet.
+	before, err := packet.Marshal()
+	assert.NoError(t, err)
+	assert.ErrorIs(t, packet.DelExtension(9), errHeaderExtensionNotFound)
+	assert.Equal(t, []uint8{1, 3}, packet.GetExtensionIDs())
+	after, err := packet.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, before, after)
+}
+
+func TestRFC8285DelExtensionThenAddExtension(t *testing.T) {
+	// After the last extension is deleted the profile is reset; SetExtension
+	// re-derives it from the payload size, so use a one-byte payload for both
+	// starting profiles to exercise the rebuild path.
+	for _, profile := range []uint16{ExtensionProfileOneByte, ExtensionProfileTwoByte} {
+		t.Run(fmt.Sprintf("profile_%x", profile), func(t *testing.T) {
+			packet := &Packet{
+				Header: Header{
+					Version:          2,
+					Padding:          true,
+					Marker:           true,
+					Extension:        true,
+					PayloadType:      96,
+					SequenceNumber:   7,
+					Timestamp:        8,
+					SSRC:             9,
+					PaddingSize:      4,
+					ExtensionProfile: profile,
+					Extensions:       []Extension{{1, []byte{0xAA}}},
+				},
+				Payload: []byte{0x01, 0x02, 0x03},
+			}
+			assert.NoError(t, packet.DelExtension(1))
+			assert.False(t, packet.Extension)
+			assert.Zero(t, packet.ExtensionProfile)
+
+			// Re-adding rebuilds a valid extension header from scratch.
+			payload := []byte{0x11, 0x22}
+			assert.NoError(t, packet.SetExtension(5, payload))
+			assert.True(t, packet.Extension)
+			assert.Equal(t, uint16(ExtensionProfileOneByte), packet.ExtensionProfile,
+				"profile must be derived from the payload after the reset")
+
+			raw, err := packet.Marshal()
+			assert.NoError(t, err)
+			assert.Equal(t, packet.MarshalSize(), len(raw))
+
+			roundTrip := &Packet{}
+			assert.NoError(t, roundTrip.Unmarshal(raw))
+			assert.Equal(t, []uint8{5}, roundTrip.GetExtensionIDs())
+			assert.Equal(t, payload, roundTrip.GetExtension(5))
+			assert.Equal(t, []byte{0x01, 0x02, 0x03}, roundTrip.Payload)
+			assert.Equal(t, packet.Header, roundTrip.Header)
+		})
+	}
+}
+
+func TestDelExtensionEdgeCasesDoNotPanic(t *testing.T) {
+	profiles := []uint16{0, ExtensionProfileOneByte, ExtensionProfileTwoByte, 0x1234}
+
+	for _, profile := range profiles {
+		for _, extensions := range [][]Extension{nil, {}, {{0, nil}}, {{0, []byte{1, 2, 3, 4}}}} {
+			packet := &Packet{
+				Header: Header{
+					Version:          2,
+					Extension:        true,
+					ExtensionProfile: profile,
+					Extensions:       extensions,
+				},
+			}
+
+			// Empty extensions and empty payloads must not panic and must
+			// leave marshaling in a consistent state.
+			raw, err := packet.Marshal()
+			if err == nil {
+				assert.Equal(t, packet.MarshalSize(), len(raw))
+			}
+			assert.ErrorIs(t, packet.DelExtension(1), errHeaderExtensionNotFound)
+			assert.True(t, packet.Extension, "failed delete must not change the packet")
+			assert.Equal(t, profile, packet.ExtensionProfile)
+		}
+	}
+
+	// Deleting the only extension of a packet with zero-length payload and no
+	// padding must produce a bare RTP header.
+	packet := &Packet{
+		Header: Header{
+			Version:          2,
+			Extension:        true,
+			ExtensionProfile: ExtensionProfileOneByte,
+			Extensions:       []Extension{{1, nil}},
+		},
+	}
+	assert.NoError(t, packet.DelExtension(1))
+	raw, err := packet.Marshal()
+	assert.NoError(t, err)
+	assert.Len(t, raw, headerLength*3)
+	assert.Zero(t, raw[0]&(1<<extensionShift), "X bit must be clear")
+	assert.Zero(t, packet.MarshalSize()-len(raw))
+
+	// 16-byte payload boundary and 4-byte alignment.
+	packet = &Packet{
+		Header: Header{
+			Version:          2,
+			Extension:        true,
+			ExtensionProfile: ExtensionProfileOneByte,
+			Extensions:       []Extension{{1, make([]byte, 16)}, {2, []byte{0x01}}},
+		},
+	}
+	assert.NoError(t, packet.DelExtension(2))
+	raw, err = packet.Marshal()
+	assert.NoError(t, err)
+	assert.Zero(t, len(raw)%4)
+	roundTrip := &Packet{}
+	assert.NoError(t, roundTrip.Unmarshal(raw))
+	assert.Equal(t, []uint8{1}, roundTrip.GetExtensionIDs())
+	assert.Equal(t, make([]byte, 16), roundTrip.GetExtension(1))
+}

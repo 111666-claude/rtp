@@ -504,6 +504,9 @@ func (h *Header) DelExtension(id uint8) error {
 		if extension.id == id {
 			h.Extensions = append(h.Extensions[:i], h.Extensions[i+1:]...)
 			if len(h.Extensions) == 0 {
+				// Clear the whole extension state so Marshal stops writing the
+				// X bit, the profile and the extension length.
+				h.Extensions = nil
 				h.Extension = false
 				h.ExtensionProfile = 0
 			}
@@ -517,7 +520,7 @@ func (h *Header) DelExtension(id uint8) error {
 
 // ClearExtensions Removes all RTP Header extension.
 func (h *Header) ClearExtensions() {
-	h.Extensions = h.Extensions[:0]
+	h.Extensions = nil
 	h.Extension = false
 	h.ExtensionProfile = 0
 }

@@ -326,3 +326,58 @@ func TestHeaderExtension_Raw(t *testing.T) {
 	assert.NoError(t, ext.Del(0))
 	assert.Nil(t, ext.Get(0))
 }
+
+func TestHeaderExtension_EmptyAndTruncatedBuffersDoNotPanic(t *testing.T) {
+	newExtensions := func() []HeaderExtension {
+		return []HeaderExtension{&OneByteHeaderExtension{}, &TwoByteHeaderExtension{}, &RawExtension{}}
+	}
+
+	// Methods on a zero-value extension must not panic.
+	for _, ext := range newExtensions() {
+		assert.NotPanics(t, func() { ext.GetIDs() })
+		assert.NotPanics(t, func() { ext.Get(1) })
+		assert.Error(t, ext.Del(1), "Deleting from an empty extension should error")
+	}
+
+	// Unmarshal must reject buffers that cannot even hold the profile.
+	for _, ext := range newExtensions() {
+		_, err := ext.Unmarshal(nil)
+		assert.ErrorIs(t, err, errTooSmall)
+
+		_, err = ext.Unmarshal([]byte{0xBE})
+		assert.ErrorIs(t, err, errTooSmall)
+	}
+
+	// Length field larger than the buffer must be rejected instead of panicking.
+	assert.ErrorIs(t,
+		func() error {
+			_, err := (&OneByteHeaderExtension{}).Unmarshal([]byte{0xBE, 0xDE, 0x00, 0x01, 0x10})
+			return err
+		}(),
+		errTooSmall)
+	assert.ErrorIs(t,
+		func() error {
+			_, err := (&TwoByteHeaderExtension{}).Unmarshal([]byte{0x10, 0x00, 0x00, 0x01, 0x01})
+			return err
+		}(),
+		errTooSmall)
+	assert.ErrorIs(t,
+		func() error { _, err := (&RawExtension{}).Unmarshal([]byte{0x12, 0x34, 0x00, 0x01, 0x01}); return err }(),
+		errTooSmall)
+
+	// Parsing a truncated extension body must stop instead of panicking.
+	oneByte := &OneByteHeaderExtension{}
+	_, err := oneByte.Unmarshal([]byte{0xBE, 0xDE, 0x00, 0x00})
+	assert.NoError(t, err)
+	assert.NotPanics(t, func() {
+		assert.Empty(t, oneByte.GetIDs())
+		assert.Nil(t, oneByte.Get(1))
+	})
+	twoByte := &TwoByteHeaderExtension{}
+	_, err = twoByte.Unmarshal([]byte{0x10, 0x00, 0x00, 0x00})
+	assert.NoError(t, err)
+	assert.NotPanics(t, func() {
+		assert.Empty(t, twoByte.GetIDs())
+		assert.Nil(t, twoByte.Get(1))
+	})
+}

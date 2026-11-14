@@ -111,6 +111,124 @@ func TestPacketizer_Roundtrip(t *testing.T) {
 	}
 }
 
+func TestPacketizer_EmptyPayloadAdvancesTimestamp(t *testing.T) {
+	payload := []byte{0x11, 0x12, 0x13, 0x14}
+	pktizer := NewPacketizerWithOptions(
+		100,
+		&codecs.G722Payloader{},
+		NewFixedSequencer(1234),
+		90000,
+		WithPayloadType(98),
+		WithSSRC(0x1234ABCD),
+		WithTimestamp(45678),
+	)
+
+	// Alternate empty and non-empty payloads. Empty calls must return no
+	// packets and no sequence numbers, but still advance the timestamp.
+	var nonEmpty [][]*Packet
+	for i := 0; i < 4; i++ {
+		var pkts []*Packet
+		if i%2 == 0 {
+			pkts = pktizer.Packetize(nil, 2000)
+			assert.Nil(t, pkts, "Empty payload must not produce packets")
+		} else {
+			pkts = pktizer.Packetize(payload, 2000)
+			assert.Len(t, pkts, 1)
+			nonEmpty = append(nonEmpty, pkts)
+		}
+	}
+
+	assert.Equal(t, uint32(45678+2000), nonEmpty[0][0].Timestamp)
+	assert.Equal(t, uint32(4000), nonEmpty[1][0].Timestamp-nonEmpty[0][0].Timestamp,
+		"Timestamp gap between non-empty packets must include the empty frame's samples")
+
+	// Empty calls must not consume sequence numbers.
+	assert.Equal(t, uint16(1234), nonEmpty[0][0].SequenceNumber)
+	assert.Equal(t, uint16(1235), nonEmpty[1][0].SequenceNumber)
+}
+
+func TestPacketizer_EmptyPayloadConsecutiveAndZeroSamples(t *testing.T) {
+	payload := []byte{0x11, 0x12, 0x13, 0x14}
+	pktizer := NewPacketizerWithOptions(
+		100,
+		&codecs.G722Payloader{},
+		NewFixedSequencer(100),
+		90000,
+		WithTimestamp(1000),
+	)
+
+	// Consecutive empty payloads accumulate.
+	assert.Nil(t, pktizer.Packetize(nil, 500))
+	assert.Nil(t, pktizer.Packetize(nil, 500))
+	assert.Nil(t, pktizer.Packetize(nil, 500))
+
+	// Empty payload with zero samples is a no-op for the timestamp.
+	assert.Nil(t, pktizer.Packetize(nil, 0))
+
+	pkts := pktizer.Packetize(payload, 100)
+	assert.Len(t, pkts, 1)
+	assert.Equal(t, uint32(2500), pkts[0].Timestamp)
+	assert.Equal(t, uint16(100), pkts[0].SequenceNumber)
+
+	// A single large samples value on an empty payload.
+	assert.Nil(t, pktizer.Packetize(nil, 0x80000000))
+	pkts = pktizer.Packetize(payload, 100)
+	assert.Len(t, pkts, 1)
+	assert.Equal(t, uint32(2500+100+0x80000000), pkts[0].Timestamp)
+	assert.Equal(t, uint16(101), pkts[0].SequenceNumber)
+}
+
+func TestPacketizer_EmptyPayloadTimestampWraparound(t *testing.T) {
+	payload := []byte{0x11, 0x12, 0x13, 0x14}
+	pktizer := NewPacketizerWithOptions(
+		100,
+		&codecs.G722Payloader{},
+		NewFixedSequencer(1),
+		90000,
+		WithTimestamp(0xFFFFFF00),
+	)
+
+	// Empty payload pushes the timestamp past the uint32 boundary.
+	assert.Nil(t, pktizer.Packetize(nil, 0x200))
+
+	pkts := pktizer.Packetize(payload, 0x100)
+	assert.Len(t, pkts, 1)
+	assert.Equal(t, uint32(0x100), pkts[0].Timestamp, "Timestamp must wrap around as uint32")
+
+	pkts = pktizer.Packetize(payload, 0x100)
+	assert.Len(t, pkts, 1)
+	assert.Equal(t, uint32(0x200), pkts[0].Timestamp)
+}
+
+func TestPacketizer_EmptyPayloadWithSkipSamplesAndAbsSendTime(t *testing.T) {
+	payload := []byte{0x11, 0x12, 0x13, 0x14}
+	pktizer := NewPacketizerWithOptions(
+		100,
+		&codecs.G722Payloader{},
+		NewFixedSequencer(1234),
+		90000,
+		WithPayloadType(98),
+		WithSSRC(0x1234ABCD),
+		WithTimestamp(45678),
+	)
+	p, ok := pktizer.(*packetizer)
+	assert.True(t, ok, "Failed to cast to *packetizer")
+	p.timegen = func() time.Time {
+		return time.Date(1985, time.June, 23, 4, 0, 0, 0, time.FixedZone("UTC-5", -5*60*60))
+	}
+	pktizer.EnableAbsSendTime(1)
+
+	pktizer.SkipSamples(3000)
+	assert.Nil(t, pktizer.Packetize(nil, 2000))
+
+	pkts := pktizer.Packetize(payload, 2000)
+	assert.Len(t, pkts, 1)
+	assert.Equal(t, uint32(45678+3000+2000), pkts[0].Timestamp)
+	assert.Equal(t, uint16(1234), pkts[0].SequenceNumber)
+	assert.True(t, pkts[0].Extension, "AbsSendTime extension must still be applied")
+	assert.Equal(t, []Extension{{id: 1, payload: []byte{0x40, 0, 0}}}, pkts[0].Extensions)
+}
+
 func TestPacketizer_GeneratePadding(t *testing.T) {
 	pktizer := NewPacketizer(100, 98, 0x1234ABCD, &codecs.G722Payloader{}, NewFixedSequencer(1234), 90000)
 

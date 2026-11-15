@@ -167,6 +167,41 @@ func TestVP9Packet_Unmarshal(t *testing.T) {
 				Payload: []byte{},
 			},
 		},
+		"ScalabilityStructureResolutionsAndPG": {
+			b: []byte{
+				0x0A,
+				(1 << 5) | (1 << 4) | (1 << 1), // NS:1 Y:1 G:1
+				640 >> 8, 640 & 0xff, 360 >> 8, 360 & 0xff,
+				1280 >> 8, 1280 & 0xff, 720 >> 8, 720 & 0xff,
+				2,
+				(0 << 5) | (1 << 4) | (1 << 2), // T:0 U:1 R:1 -
+				33,
+				(2 << 5) | (0 << 4) | (0 << 2), // T:2 U:0 R:0 -
+				0xAA,
+			},
+			pkt: VP9Packet{
+				B:       true,
+				V:       true,
+				NS:      1,
+				Y:       true,
+				G:       true,
+				NG:      2,
+				Width:   []uint16{640, 1280},
+				Height:  []uint16{360, 720},
+				PGTID:   []uint8{0, 2},
+				PGU:     []bool{true, false},
+				PGPDiff: [][]uint8{{33}, {}},
+				Payload: []byte{0xAA},
+			},
+		},
+		"ScalabilityStructureShortPacket0": {
+			b:   []byte{0x0A, 0x30, 0x02, 0x80},
+			err: errShortPacket,
+		},
+		"ScalabilityStructureShortPacket1": {
+			b:   []byte{0x0A, 0x30},
+			err: errShortPacket,
+		},
 	}
 	for name, c := range cases {
 		c := c
@@ -192,6 +227,160 @@ func TestVP9Packet_Unmarshal(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestVP9Packet_UnmarshalTruncatedSS(t *testing.T) {
+	// Scalability structure with every optional branch enabled:
+	// NS:1 (2 spatial layers), Y:1 (2*4 resolution bytes), G:1, NG:2 with
+	// R:1 / R:0 reference indices, followed by a payload byte.
+	full := []byte{
+		0x0A,
+		(1 << 5) | (1 << 4) | (1 << 1),
+		640 >> 8, 640 & 0xff, 360 >> 8, 360 & 0xff,
+		1280 >> 8, 1280 & 0xff, 720 >> 8, 720 & 0xff,
+		2,
+		(0 << 5) | (1 << 4) | (1 << 2),
+		33,
+		(2 << 5) | (0 << 4) | (0 << 2),
+		0xAA,
+	}
+
+	// The complete packet must still parse in full.
+	p := VP9Packet{}
+	raw, err := p.Unmarshal(full)
+	if err != nil {
+		t.Fatalf("Unexpected error for complete packet: %v", err)
+	}
+	if !reflect.DeepEqual(raw, []byte{0xAA}) {
+		t.Errorf("Unexpected payload: %v", raw)
+	}
+
+	// The full header without the trailing payload byte makes a valid packet
+	// with an empty payload.
+	p = VP9Packet{}
+	raw, err = p.Unmarshal(full[:len(full)-1])
+	if err != nil {
+		t.Fatalf("Unexpected error for header-only packet: %v", err)
+	}
+	if !reflect.DeepEqual(raw, []byte{}) {
+		t.Errorf("Expected empty payload, got %v", raw)
+	}
+
+	// Every truncation inside the header must return an error (no panic, no
+	// hang) and a nil payload.
+	headerLen := len(full) - 1
+	for n := 1; n < headerLen; n++ {
+		p := VP9Packet{}
+		raw, err := p.Unmarshal(full[:n])
+		if err == nil {
+			t.Errorf("len %d: expected error for truncated packet", n)
+			continue
+		}
+		if !errors.Is(err, errShortPacket) {
+			t.Errorf("len %d: expected errShortPacket, got %v", n, err)
+		}
+		if raw != nil {
+			t.Errorf("len %d: expected nil payload, got %v", n, raw)
+		}
+	}
+}
+
+func TestVP9Packet_UnmarshalShortPacketStable(t *testing.T) {
+	// 4 byte packet: V=1 with enough room for only one of two spatial layer
+	// resolutions. Must consistently fail without touching the stream state.
+	short := []byte{0x0A, 0x30, 0x02, 0x80}
+	var firstErr error
+	for i := 0; i < 100; i++ {
+		p := VP9Packet{}
+		raw, err := p.Unmarshal(short)
+		if err == nil {
+			t.Fatalf("round %d: expected error", i)
+		}
+		if raw != nil {
+			t.Fatalf("round %d: expected nil payload, got %v", i, raw)
+		}
+		if i == 0 {
+			firstErr = err
+			continue
+		}
+		if err.Error() != firstErr.Error() {
+			t.Fatalf("round %d: error changed from %v to %v", i, firstErr, err)
+		}
+	}
+
+	// Neighbouring boundaries around the 4 byte packet: anything shorter than
+	// the full 10 byte SS header (0x0A + 0x30 + two WIDTH/HEIGHT pairs) must
+	// fail, and the full header must succeed with an empty payload.
+	for _, tc := range []struct {
+		b       []byte
+		wantErr bool
+	}{
+		{[]byte{0x0A}, true},
+		{[]byte{0x0A, 0x30}, true},
+		{[]byte{0x0A, 0x30, 0x02}, true},
+		{[]byte{0x0A, 0x30, 0x02, 0x80}, true},
+		{[]byte{0x0A, 0x30, 0x02, 0x80, 0x01}, true},
+		{[]byte{0x0A, 0x30, 0x02, 0x80, 0x01, 0x68, 0x02, 0xD0, 0x05}, true},
+		{[]byte{0x0A, 0x30, 0x02, 0x80, 0x01, 0x68, 0x02, 0xD0, 0x05, 0x00}, false},
+	} {
+		for i := 0; i < 100; i++ {
+			p := VP9Packet{}
+			_, err := p.Unmarshal(tc.b)
+			if tc.wantErr && err == nil {
+				t.Fatalf("len %d round %d: expected error", len(tc.b), i)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("len %d round %d: unexpected error %v", len(tc.b), i, err)
+			}
+		}
+	}
+}
+
+func TestVP9Packet_UnmarshalLayerOrder(t *testing.T) {
+	// Temporal, spatial and reference information must be delivered in the
+	// order they appear on the wire, including multiple SS spatial layers and
+	// picture-group reference indices.
+	p := VP9Packet{}
+	b := []byte{
+		0xFA,       // I=1 P=1 L=1 F=1 B=1 V=1
+		0x80, 0x2A, // PictureID 0x2A (15 bit)
+		0x72,             // TID=3 U=1 SID=1 D=0
+		0x07, 0x09, 0x0A, // PDiff: 3, 4, 5
+		(1 << 5) | (0 << 4) | (1 << 3), // NS:1 Y:0 G:1
+		2,
+		(1 << 5) | (1 << 4) | (1 << 2), // PG0: TID=1 U=1 R=1
+		42,
+		(2 << 5) | (0 << 4) | (0 << 2), // PG1: TID=2 U=0 R=0
+		0xBB,
+	}
+	raw, err := p.Unmarshal(b)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(raw, []byte{0xBB}) {
+		t.Errorf("Unexpected payload: %v", raw)
+	}
+	if p.PictureID != 0x2A {
+		t.Errorf("PictureID = %d, want 42", p.PictureID)
+	}
+	if p.TID != 3 || !p.U || p.SID != 1 || p.D {
+		t.Errorf("Layer info = {%d %v %d %v}, want {3 true 1 false}", p.TID, p.U, p.SID, p.D)
+	}
+	if !reflect.DeepEqual(p.PDiff, []uint8{3, 4, 5}) {
+		t.Errorf("PDiff = %v, want [3 4 5]", p.PDiff)
+	}
+	if p.NS != 1 || !p.G || p.NG != 2 {
+		t.Errorf("SS = {NS:%d Y:%v G:%v NG:%d}", p.NS, p.Y, p.G, p.NG)
+	}
+	if !reflect.DeepEqual(p.PGTID, []uint8{1, 2}) {
+		t.Errorf("PGTID = %v, want [1 2]", p.PGTID)
+	}
+	if !reflect.DeepEqual(p.PGU, []bool{true, false}) {
+		t.Errorf("PGU = %v, want [true false]", p.PGU)
+	}
+	if !reflect.DeepEqual(p.PGPDiff, [][]uint8{{42}, {}}) {
+		t.Errorf("PGPDiff = %v, want [[42] []]", p.PGPDiff)
 	}
 }
 

@@ -161,6 +161,26 @@ func (p *VP9Packet) Unmarshal(packet []byte) ([]byte, error) {
 		return nil, errShortPacket
 	}
 
+	// Reset optional fields so that reusing the same VP9Packet for several
+	// packets yields the same result as unmarshalling into a fresh one.
+	p.PictureID = 0
+	p.TID = 0
+	p.U = false
+	p.SID = 0
+	p.D = false
+	p.PDiff = nil
+	p.TL0PICIDX = 0
+	p.NS = 0
+	p.Y = false
+	p.G = false
+	p.NG = 0
+	p.Width = nil
+	p.Height = nil
+	p.PGTID = nil
+	p.PGU = nil
+	p.PGPDiff = nil
+	p.Payload = nil
+
 	p.I = packet[0]&0x80 != 0
 	p.P = packet[0]&0x40 != 0
 	p.L = packet[0]&0x20 != 0
@@ -345,6 +365,10 @@ func (p *VP9Packet) parseSSData(packet []byte, pos int) (int, error) {
 	p.NG = 0
 
 	if p.Y {
+		// Each spatial layer carries a WIDTH and HEIGHT pair.
+		if len(packet)-pos < 4*int(NS) {
+			return pos, errShortPacket
+		}
 		p.Width = make([]uint16, NS)
 		p.Height = make([]uint16, NS)
 		for i := 0; i < int(NS); i++ {
@@ -356,16 +380,25 @@ func (p *VP9Packet) parseSSData(packet []byte, pos int) (int, error) {
 	}
 
 	if p.G {
+		if len(packet) <= pos {
+			return pos, errShortPacket
+		}
 		p.NG = packet[pos]
 		pos++
 	}
 
 	for i := 0; i < int(p.NG); i++ {
+		if len(packet) <= pos {
+			return pos, errShortPacket
+		}
 		p.PGTID = append(p.PGTID, packet[pos]>>5)
 		p.PGU = append(p.PGU, packet[pos]&0x10 != 0)
 		R := (packet[pos] >> 2) & 0x3
 		pos++
 
+		if len(packet)-pos < int(R) {
+			return pos, errShortPacket
+		}
 		p.PGPDiff = append(p.PGPDiff, []uint8{})
 		for j := 0; j < int(R); j++ {
 			p.PGPDiff[i] = append(p.PGPDiff[i], packet[pos])

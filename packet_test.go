@@ -62,9 +62,8 @@ func TestBasic(t *testing.T) {
 		t.Errorf("TestBasic marshal: got %#v, want %#v", raw, rawPkt)
 	}
 
-	// TODO This is a BUG but without it, stuff breaks.
-	if p.PayloadOffset != 12 {
-		t.Errorf("wrong payload offset: %d != %d", p.PayloadOffset, 12)
+	if p.PayloadOffset != 20 {
+		t.Errorf("wrong payload offset: %d != %d", p.PayloadOffset, 20)
 	}
 }
 
@@ -108,7 +107,8 @@ func TestRFC8285OneByteExtension(t *testing.T) {
 
 	rawPkt := []byte{
 		0x90, 0xe0, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
-		0x27, 0x82, 0xBE, 0xDE, 0x00, 0x01, 0x50, 0xAA, 0x98, 0x36, 0xbe, 0x88, 0x9e,
+		0x27, 0x82, 0xBE, 0xDE, 0x00, 0x01, 0x50, 0xAA, 0x00, 0x00,
+		0x98, 0x36, 0xbe, 0x88, 0x9e,
 	}
 	if err := p.Unmarshal(rawPkt); err != nil {
 		t.Fatal("Unmarshal err for valid extension")
@@ -124,20 +124,83 @@ func TestRFC8285OneByteExtension(t *testing.T) {
 			}},
 		},
 		Version:        2,
-		PayloadOffset:  18,
+		PayloadOffset:  20,
 		PayloadType:    96,
 		SequenceNumber: 27023,
 		Timestamp:      3653407706,
 		SSRC:           476325762,
 		CSRC:           []uint32{},
 	},
-		Payload: rawPkt[18:],
+		Payload: rawPkt[20:],
 		Raw:     rawPkt,
 	}
 
 	dstData, _ := p.Marshal()
 	if !bytes.Equal(dstData, rawPkt) {
 		t.Error("Marshal failed")
+	}
+}
+
+func TestRFC8285OneByteTwoExtensionOfTwoBytes(t *testing.T) {
+	p := &Packet{}
+
+	//  0                   1                   2                   3
+	//  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+	// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	// |       0xBE    |    0xDE       |           length=1            |
+	// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	// |  ID   | L=0   |     data      |  ID   |  L=0  |   data...
+	// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	rawPkt := []byte{
+		0x90, 0xe0, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
+		0x27, 0x82, 0xBE, 0xDE, 0x00, 0x01, 0x10, 0xAA, 0x20, 0xBB,
+		// Payload
+		0x98, 0x36, 0xbe, 0x88, 0x9e,
+	}
+	if err := p.Unmarshal(rawPkt); err != nil {
+		t.Fatal("Unmarshal err for valid extension")
+	}
+
+	ext1 := p.GetExtension(1)
+	ext1Expect := []byte{0xAA}
+	if !bytes.Equal(ext1, ext1Expect) {
+		t.Errorf("Extension has incorrect data. Got: %+v, Expected: %+v", ext1, ext1Expect)
+	}
+
+	ext2 := p.GetExtension(2)
+	ext2Expect := []byte{0xBB}
+	if !bytes.Equal(ext2, ext2Expect) {
+		t.Errorf("Extension has incorrect data. Got: %+v, Expected: %+v", ext2, ext2Expect)
+	}
+
+	// Test Marshal
+	p = &Packet{Header: Header{
+		Marker:           true,
+		Extension:        true,
+		ExtensionProfile: 0xBEDE,
+		Extensions: []Extension{
+			{1, []byte{
+				0xAA,
+			}},
+			{2, []byte{
+				0xBB,
+			}},
+		},
+		Version:        2,
+		PayloadOffset:  20,
+		PayloadType:    96,
+		SequenceNumber: 27023,
+		Timestamp:      3653407706,
+		SSRC:           476325762,
+		CSRC:           []uint32{},
+	},
+		Payload: rawPkt[20:],
+		Raw:     rawPkt,
+	}
+
+	dstData, _ := p.Marshal()
+	if !bytes.Equal(dstData, rawPkt) {
+		t.Errorf("Marshal failed raw \nMarshaled: %+v,\nrawPkt:     %+v", dstData, rawPkt)
 	}
 }
 
@@ -199,7 +262,7 @@ func TestRFC8285OneByteMultipleExtensions(t *testing.T) {
 	rawPkt := []byte{
 		0x90, 0xe0, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
 		0x27, 0x82, 0xBE, 0xDE, 0x00, 0x03, 0x10, 0xAA, 0x21, 0xBB,
-		0xBB, 0x33, 0xCC, 0xCC, 0xCC, 0xCC,
+		0xBB, 0x33, 0xCC, 0xCC, 0xCC, 0xCC, 0x00, 0x00,
 		// Payload
 		0x98, 0x36, 0xbe, 0x88, 0x9e,
 	}
@@ -220,14 +283,14 @@ func TestRFC8285OneByteMultipleExtensions(t *testing.T) {
 			}},
 		},
 		Version:        2,
-		PayloadOffset:  26,
+		PayloadOffset:  28,
 		PayloadType:    96,
 		SequenceNumber: 27023,
 		Timestamp:      3653407706,
 		SSRC:           476325762,
 		CSRC:           []uint32{},
 	},
-		Payload: rawPkt[26:],
+		Payload: rawPkt[28:],
 		Raw:     rawPkt,
 	}
 
@@ -242,10 +305,10 @@ func TestRFC8285TwoByteExtension(t *testing.T) {
 
 	rawPkt := []byte{
 		0x90, 0xe0, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
-		0x27, 0x82, 0x10, 0x00, 0x00, 0x01, 0x05, 0x18, 0xAA, 0xAA,
+		0x27, 0x82, 0x10, 0x00, 0x00, 0x07, 0x05, 0x18, 0xAA, 0xAA,
 		0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
 		0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
-		0xAA, 0xAA, 0x98, 0x36, 0xbe, 0x88, 0x9e,
+		0xAA, 0xAA, 0x00, 0x00, 0x98, 0x36, 0xbe, 0x88, 0x9e,
 	}
 	if err := p.Unmarshal(rawPkt); err != nil {
 		t.Fatal("Unmarshal err for valid extension")
@@ -263,14 +326,14 @@ func TestRFC8285TwoByteExtension(t *testing.T) {
 			}},
 		},
 		Version:        2,
-		PayloadOffset:  42,
+		PayloadOffset:  44,
 		PayloadType:    96,
 		SequenceNumber: 27023,
 		Timestamp:      3653407706,
 		SSRC:           476325762,
 		CSRC:           []uint32{},
 	},
-		Payload: rawPkt[42:],
+		Payload: rawPkt[44:],
 		Raw:     rawPkt,
 	}
 
@@ -343,7 +406,7 @@ func TestRFC8285TwoByteMultipleExtensionsWithLargeExtension(t *testing.T) {
 	// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 	rawPkt := []byte{
 		0x90, 0xe0, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
-		0x27, 0x82, 0x10, 0x00, 0x00, 0x03, 0x01, 0x00, 0x02, 0x01,
+		0x27, 0x82, 0x10, 0x00, 0x00, 0x06, 0x01, 0x00, 0x02, 0x01,
 		0xBB, 0x03, 0x11, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
 		0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
 		// Payload

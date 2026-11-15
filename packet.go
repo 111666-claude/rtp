@@ -192,6 +192,11 @@ func (h *Header) Unmarshal(buf []byte) (n int, err error) { //nolint:gocognit,cy
 					n++
 
 					if extid == extensionIDReserved {
+						// Reserved ID terminates extension parsing; skip any
+						// remaining extension bytes so they are not delivered
+						// as payload.
+						n = extensionEnd
+
 						break
 					}
 				} else {

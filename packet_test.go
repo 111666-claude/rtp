@@ -897,8 +897,33 @@ func TestRFC8285OneByteExtensionTermianteProcessingWhenReservedIDEncountered(t *
 	)
 	assert.Len(t, packet.Extensions, 0, "Extensions should be empty for invalid id")
 
-	payload := reservedIDPkt[17:]
+	// The reserved ID terminates extension parsing; the remaining extension
+	// bytes (0xAA, 0x98, 0x36) must be skipped, not delivered as payload.
+	payload := reservedIDPkt[20:]
 	assert.Equal(t, payload, packet.Payload)
+}
+
+func TestRFC8285OneByteExtensionReservedIDBoundary(t *testing.T) {
+	// Reserved ID with packet padding: padding must still be stripped and
+	// only the real payload delivered.
+	paddedPkt := []byte{
+		0xb0, 0xe0, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
+		0x27, 0x82, 0xBE, 0xDE, 0x00, 0x01, 0xF0, 0xAA, 0x98, 0x36,
+		0xbe, 0x88, 0x9e, 0x00, 0x00, 0x03,
+	}
+	padded := &Packet{}
+	assert.NoError(t, padded.Unmarshal(paddedPkt))
+	assert.Equal(t, []byte{0xbe, 0x88, 0x9e}, padded.Payload)
+	assert.EqualValues(t, 3, padded.Header.PaddingSize)
+
+	// Reserved ID with no payload at all: payload must be empty.
+	extensionOnlyPkt := []byte{
+		0x90, 0xe0, 0x69, 0x8f, 0xd9, 0xc2, 0x93, 0xda, 0x1c, 0x64,
+		0x27, 0x82, 0xBE, 0xDE, 0x00, 0x01, 0xF0, 0xAA, 0x98, 0x36,
+	}
+	extensionOnly := &Packet{}
+	assert.NoError(t, extensionOnly.Unmarshal(extensionOnlyPkt))
+	assert.Empty(t, extensionOnly.Payload)
 }
 
 func TestRFC8285OneByteSetExtensionShouldErrorWhenPayloadTooLarge(t *testing.T) {

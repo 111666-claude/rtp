@@ -38,6 +38,9 @@ func (p *VP8Payloader) Payload(mtu int, payload []byte) [][]byte {
 	 */
 
 	maxFragmentSize := mtu - vp8HeaderSize
+	if maxFragmentSize <= 0 || len(payload) == 0 {
+		return nil
+	}
 
 	payloadData := payload
 	payloadDataRemaining := len(payload)

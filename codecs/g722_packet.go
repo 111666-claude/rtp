@@ -5,6 +5,10 @@ type G722Payloader struct{}
 
 // Payload fragments an G722 packet across one or more byte arrays
 func (p *G722Payloader) Payload(mtu int, payload []byte) [][]byte {
+	if mtu <= 0 || len(payload) == 0 {
+		return nil
+	}
+
 	var out [][]byte
 	for len(payload) > mtu {
 		o := make([]byte, mtu)

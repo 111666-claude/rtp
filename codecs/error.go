@@ -12,6 +12,11 @@ var (
 	errTooManySpatialLayers = errors.New("too many spatial layers")
 	errUnhandledNALUType    = errors.New("NALU Type is unhandled")
 
+	// Opus Errors.
+	errOpusZeroFrames         = errors.New("opus packet contains zero frames")
+	errOpusInvalidFrameLength = errors.New("opus packet contains an invalid frame length")
+	errOpusTooMuchAudio       = errors.New("opus packet contains more than 120ms of audio")
+
 	// AV1 Errors.
 	errIsKeyframeAndFragment = errors.New(
 		"bits Z and N are set. Not possible to have OBU be tail fragment and be keyframe",

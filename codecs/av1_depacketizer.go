@@ -187,6 +187,16 @@ func (d *AV1Depacketizer) Unmarshal(payload []byte) (buff []byte, err error) {
 	return buff, nil
 }
 
+// Reset drops any OBU fragment buffered from a previous packet and clears the
+// aggregation header flags. It is used by callers that assemble whole temporal
+// units and need to restart from a clean state after a unit is discarded.
+func (d *AV1Depacketizer) Reset() {
+	d.buffer = nil
+	d.Z = false
+	d.Y = false
+	d.N = false
+}
+
 // IsPartitionHead returns true if Z in the AV1 Aggregation Header
 // is set to 0.
 func (d *AV1Depacketizer) IsPartitionHead(payload []byte) bool {

@@ -16,4 +16,12 @@ var (
 	errIsKeyframeAndFragment = errors.New(
 		"bits Z and N are set. Not possible to have OBU be tail fragment and be keyframe",
 	)
+
+	// Telephone-event Errors.
+	ErrUnknownTelephoneEvent          = errors.New("unknown telephone event")
+	ErrTelephoneEventPayloadTooShort  = errors.New("telephone-event payload is not large enough")
+	ErrTelephoneEventVolumeOutOfRange = errors.New("telephone-event volume out of range")
+	ErrTelephoneEventDurationRollback = errors.New("telephone-event duration must not decrease")
+	ErrTelephoneEventDurationOverflow = errors.New("telephone-event duration overflows the duration field")
+	ErrTelephoneEventNoUpdates        = errors.New("telephone event requires at least one duration update")
 )
